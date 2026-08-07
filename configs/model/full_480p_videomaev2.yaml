@@ -1,0 +1,46 @@
+video:
+  num_frames: 16
+  target_height: 480
+  target_width: 768
+  target_fps: 12.0
+
+encoder:
+  name: videomaev2_vitb
+  source_root: /share/project/liujingyi/progressive_video_rae/third_party/upstream/videomaev2
+  checkpoint_path: /share/project/liujingyi/ckpts/videomaev2/vitb/distill/vit_b_k710_dl_from_giant.pth
+  input_height: 480
+  input_width: 768
+  patch_size: 16
+  tubelet_size: 2
+  output_layers: [4, 6, 8, 10, 12]
+  embed_dim: 768
+  freeze: true
+  variant: vit_base_patch16_224
+
+state:
+  num_frames: 16
+  height: 30
+  width: 48
+  channels: 48
+  num_sets: 64
+  layout_version: fps_v1_h30_w48_s64
+
+projector:
+  hidden_dim: 512
+  depth: 4
+  num_heads: 8
+  mlp_ratio: 4.0
+  dropout: 0.0
+
+decoder:
+  name: wan2.2
+  source_root: /share/project/lgy/Wan2.2
+  checkpoint_path: /share/project/liujingyi/ckpts/wan2.2/ti2v_5b/Wan2.2_VAE.pth
+  output_height: 480
+  output_width: 768
+  latent_channels: 48
+  base_dim: 256
+  spatial_upsample: 16
+  temporal_upsample: 1
+  feature_cache: false
+

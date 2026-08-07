@@ -1,0 +1,20 @@
+model_config: configs/model/full_480p.yaml
+data_config: configs/data/default.yaml
+
+stage: stage1a
+max_steps: 10000
+global_batch_size: 64
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+precision: bf16
+projector_lr: 1.0e-4
+decoder_lr: 5.0e-5
+discriminator_lr: 5.0e-5
+weight_decay: 0.05
+warmup_steps: 1000
+gradient_clip: 1.0
+cache_mode: disabled
+full_prefix_probability: 1.0
+output_dir: outputs/stage1a
+save_every: 1000
+log_every: 10

@@ -1,0 +1,12 @@
+model_config: configs/model/full_480p.yaml
+data_config: configs/data/default.yaml
+split: test_balanced
+batch_size: 1
+precision: bf16
+prefixes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
+max_clips: 2048
+save_videos: true
+save_video_limit: 8
+compute_fvd: true
+i3d_checkpoint: /share/project/liujingyi/ckpts/evaluation/i3d_torchscript.pt
+check_cache_equivalence: true

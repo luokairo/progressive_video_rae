@@ -1,0 +1,10 @@
+/home/shuchenweng/zhj/data/MTV_data_combine_movies_cdm_moviebench_sf20k/merged_without_sf20k_speaker=1_speaker_time_filter_speaker_time_higher_0.7_dialog_PQ_higher_6.5.csv
+这个是单人说话的数据
+
+
+/home/shuchenweng/zhj/data/MTV_data_combine_movies_cdm_moviebench_sf20k/MTV_effect_vocal=0_audio_prob_higher_0.8.csv
+这个是 无人说话一定有环境音（脚步，汽车声等等）的
+
+
+/home/shuchenweng/zhj/data/MTV_data_combine_movies_cdm_moviebench_sf20k/MTV_music_vocal=0.csv
+这个是 无人说话一定有音乐的

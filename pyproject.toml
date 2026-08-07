@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "progressive-video-rae"
+version = "0.1.0"
+description = "Full-resolution progressive VideoRAE with fixed frequency sets and a Wan2.2 decoder."
+readme = "README.md"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+  "numpy==1.26.4",
+  "torch==2.5.1",
+  "torchvision==0.20.1",
+  "transformers==4.51.3",
+  "accelerate==1.6.0",
+  "timm==1.0.15",
+  "einops",
+  "av",
+  "pandas",
+  "pyarrow",
+  "scipy",
+  "scikit-image",
+  "torch-dct",
+  "lpips",
+  "torchmetrics",
+  "matplotlib",
+  "hydra-core",
+  "omegaconf",
+  "safetensors",
+  "tqdm",
+]
+
+[project.optional-dependencies]
+train = ["wandb", "tensorboard", "xformers==0.0.29.post1"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+pvr-build-manifest = "progressive_video_rae.data.build_manifest:main"
+pvr-train = "progressive_video_rae.train:main"
+pvr-evaluate = "progressive_video_rae.evaluate:main"
+pvr-validate-checkpoints = "progressive_video_rae.tools.validate_checkpoints:main"
+
+[tool.setuptools.packages.find]
+include = ["progressive_video_rae*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "gpu: requires a CUDA GPU and model checkpoints",
+  "integration: requires optional upstream code or video codecs",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
