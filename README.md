@@ -1,5 +1,7 @@
 # Progressive VideoRAE
 
+当前版本：`v_0`。
+
 首版实现面向 `16 × 480 × 768 @ 12 FPS` 视频，使用全分辨率 V-JEPA2 特征、固定的 64 组 progressive state、帧内低频到高频因果 projector，以及可显式控制 feature cache 的 Wan2.2 decoder。
 
 核心张量约定：
