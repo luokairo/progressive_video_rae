@@ -7,7 +7,7 @@ name = "progressive-video-rae"
 version = "0.1.0"
 description = "Full-resolution progressive VideoRAE with fixed frequency sets and a Wan2.2 decoder."
 readme = "README.md"
-requires-python = ">=3.10,<3.12"
+requires-python = ">=3.10,<3.13"
 dependencies = [
   "numpy==1.26.4",
   "torch==2.5.1",
@@ -36,13 +36,13 @@ train = ["wandb", "tensorboard", "xformers==0.0.29.post1"]
 dev = ["pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
-pvr-build-manifest = "progressive_video_rae.data.build_manifest:main"
-pvr-train = "progressive_video_rae.train:main"
-pvr-evaluate = "progressive_video_rae.evaluate:main"
-pvr-validate-checkpoints = "progressive_video_rae.tools.validate_checkpoints:main"
+pvr-build-manifest = "progressive_videorae.data.build_manifest:main"
+pvr-train = "progressive_videorae.train:main"
+pvr-evaluate = "progressive_videorae.evaluate:main"
+pvr-validate-checkpoints = "progressive_videorae.tools.validate_checkpoints:main"
 
 [tool.setuptools.packages.find]
-include = ["progressive_video_rae*"]
+include = ["progressive_videorae*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

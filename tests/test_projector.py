@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from progressive_video_rae.model.projector import CausalFrequencyProjector
+from progressive_videorae.model.projector import CausalFrequencyProjector
 
 
 def test_future_set_perturbation_cannot_change_earlier_output():

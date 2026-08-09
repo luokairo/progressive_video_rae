@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from progressive_video_rae.model.progressive_sets import (
+from progressive_videorae.model.progressive_sets import (
     SET_SIZES,
     build_causal_attention_mask,
     build_progressive_layout,

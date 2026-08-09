@@ -3,7 +3,7 @@ data_config: configs/data/default.yaml
 split: test_balanced
 batch_size: 1
 precision: bf16
-prefixes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64]
+prefixes: [1, 4, 8, 16, 32, 48, 63, 64]
 max_clips: 2048
 save_videos: true
 save_video_limit: 8

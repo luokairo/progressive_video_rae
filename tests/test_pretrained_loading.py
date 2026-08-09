@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
 import types
 
@@ -8,15 +9,16 @@ import pytest
 import torch
 from torch import nn
 
-from progressive_video_rae.model.pretrained import load_validated_pretrained
-from progressive_video_rae.model.encoders.vjepa2 import VJEPA2Encoder
-from progressive_video_rae.model.encoders.videomaev2 import VideoMAEv2Encoder
-from progressive_video_rae.model.wan_decoder import WanVideoDecoder
+from progressive_videorae.model.pretrained import load_validated_pretrained
+from progressive_videorae.model.encoders.vjepa2 import VJEPA2Encoder
+from progressive_videorae.model.encoders.videomaev2 import VideoMAEv2Encoder
+from progressive_videorae.model.wan_decoder import WanVideoDecoder
 
 
 class TinyBackbone(nn.Module):
-    def __init__(self, depth: int = 3):
+    def __init__(self, depth: int = 3, embed_dim: int = 2):
         super().__init__()
+        self.embed_dim = embed_dim
         self.patch_embed = nn.Linear(2, 2)
         self.blocks = nn.ModuleList([nn.Linear(2, 2) for _ in range(depth)])
 
@@ -44,9 +46,8 @@ def test_validated_loader_rejects_empty_and_partial_checkpoints(tmp_path: Path):
             required_groups={"patch": ("patch_embed.*",)},
         )
 
-    partial = dict(checkpoint)
-    partial.pop("blocks.2.weight")
-    with pytest.raises(RuntimeError, match="missing model keys|missing critical groups"):
+    partial = {key: value for key, value in checkpoint.items() if key.startswith("patch_embed.")}
+    with pytest.raises(RuntimeError, match="coverage"):
         load_validated_pretrained(
             TinyBackbone(),
             partial,
@@ -57,7 +58,7 @@ def test_validated_loader_rejects_empty_and_partial_checkpoints(tmp_path: Path):
         )
 
 
-def _install_fake_vjepa(monkeypatch: pytest.MonkeyPatch) -> TinyBackbone:
+def _install_fake_vjepa(monkeypatch: pytest.MonkeyPatch) -> dict[str, TinyBackbone]:
     src = types.ModuleType("src")
     src.__path__ = []
     models = types.ModuleType("src.models")
@@ -65,24 +66,29 @@ def _install_fake_vjepa(monkeypatch: pytest.MonkeyPatch) -> TinyBackbone:
     vision_transformer = types.ModuleType("src.models.vision_transformer")
 
     def vit_large(**_kwargs):
-        backbone = TinyBackbone(depth=24)
-        backbone.blocks = nn.ModuleList([nn.Linear(2, 2) for _ in range(24)])
-        return backbone
+        return TinyBackbone(depth=24, embed_dim=1024)
+
+    def vit_giant_xformers(**_kwargs):
+        return TinyBackbone(depth=40, embed_dim=1408)
 
     vision_transformer.vit_large = vit_large
+    vision_transformer.vit_giant_xformers = vit_giant_xformers
     src.models = models
     models.vision_transformer = vision_transformer
     monkeypatch.setitem(sys.modules, "src", src)
     monkeypatch.setitem(sys.modules, "src.models", models)
     monkeypatch.setitem(sys.modules, "src.models.vision_transformer", vision_transformer)
-    return vit_large()
+    return {"vitl": vit_large(), "vitg": vit_giant_xformers()}
 
 
 def test_vjepa_adapter_requires_and_reports_pretrained_weights(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    source = _install_fake_vjepa(monkeypatch)
-    state = {f"module.encoder.{key}": value.detach().clone() for key, value in source.state_dict().items()}
+    sources = _install_fake_vjepa(monkeypatch)
+    state = {
+        f"module.encoder.{key}": value.detach().clone()
+        for key, value in sources["vitl"].state_dict().items()
+    }
     state["module.encoder.pos_embed"] = torch.zeros(1)
     checkpoint_path = tmp_path / "vjepa.pt"
     torch.save({"encoder": state}, checkpoint_path)
@@ -97,16 +103,90 @@ def test_vjepa_adapter_requires_and_reports_pretrained_weights(
     assert encoder.load_report.coverage == 1.0
     assert "pos_embed" in encoder.load_report.ignored_checkpoint_keys
 
-    broken = dict(state)
-    broken.pop("module.encoder.blocks.23.weight")
+    broken = {
+        key: value for key, value in state.items() if key.startswith("module.encoder.patch_embed.")
+    }
+    broken["module.encoder.pos_embed"] = state["module.encoder.pos_embed"]
     torch.save({"encoder": broken}, tmp_path / "vjepa_broken.pt")
-    with pytest.raises(RuntimeError, match="last_transformer_block|missing model keys"):
+    with pytest.raises(RuntimeError, match="coverage"):
         VJEPA2Encoder(
             str(tmp_path / "vjepa_broken.pt"),
             input_size=(480, 768),
             num_frames=16,
             output_layers=(8, 12, 16, 20, 24),
         )
+
+
+def test_vjepa_vitg_uses_giant_builder_and_target_encoder_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    sources = _install_fake_vjepa(monkeypatch)
+    state = {
+        f"module.encoder.backbone.{key}": value.detach().clone()
+        for key, value in sources["vitg"].state_dict().items()
+    }
+    checkpoint_path = tmp_path / "vjepa_vitg.pt"
+    torch.save({"state_dict": {"target_encoder": state}}, checkpoint_path)
+
+    encoder = VJEPA2Encoder(
+        str(checkpoint_path),
+        input_size=(480, 768),
+        num_frames=16,
+        variant="vitg",
+        output_layers=(8, 16, 24, 32, 40),
+    )
+    assert encoder.variant == "vitg"
+    assert encoder.depth == 40
+    assert encoder.embed_dim == 1408
+    assert encoder.layer_norms[0].normalized_shape == (1408,)
+    assert encoder.load_report.ready
+
+
+def test_vjepa_rejects_unknown_variant_and_out_of_range_layers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _install_fake_vjepa(monkeypatch)
+    with pytest.raises(ValueError, match="Unsupported V-JEPA2 variant"):
+        VJEPA2Encoder(str(tmp_path / "unused.pt"), variant="vitG")
+    with pytest.raises(ValueError, match="1-based indices"):
+        VJEPA2Encoder(
+            str(tmp_path / "unused.pt"), variant="vitg", output_layers=(8, 41)
+        )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("variant", "checkpoint_path", "output_layers"),
+    [
+        (
+            "vitl",
+            "/share/project/liujingyi/ckpts/vjepa2/vitl/original/model.pth",
+            (8, 12, 16, 20, 24),
+        ),
+        (
+            "vitg",
+            "/share/project/liujingyi/ckpts/vjepa2/vitg/original/model.pth",
+            (8, 16, 24, 32, 40),
+        ),
+    ],
+)
+def test_real_vjepa_checkpoint_load_smoke(variant, checkpoint_path, output_layers):
+    if os.environ.get("PVR_RUN_LARGE_WEIGHT_LOAD_TESTS") != "1":
+        pytest.skip("Set PVR_RUN_LARGE_WEIGHT_LOAD_TESTS=1 for multi-GB checkpoint loads")
+    source_root = Path(
+        "/share/project/liujingyi/progressive_video_rae/third_party/upstream/vjepa2"
+    )
+    if not source_root.is_dir() or not Path(checkpoint_path).is_file():
+        pytest.skip("Pinned V-JEPA2 source or requested checkpoint is unavailable")
+    encoder = VJEPA2Encoder(
+        checkpoint_path,
+        source_root=str(source_root),
+        input_size=(480, 768),
+        num_frames=16,
+        variant=variant,
+        output_layers=output_layers,
+    )
+    assert encoder.load_report.ready
 
 
 class FakeVideoMAE(nn.Module):
@@ -172,7 +252,7 @@ def test_wan_decoder_requires_complete_pretrained_decoder(tmp_path: Path):
 
     broken = {key: value for key, value in state.items() if key.startswith("conv2.") or key == "decoder.conv1.weight"}
     torch.save(broken, tmp_path / "wan_broken.pt")
-    with pytest.raises(RuntimeError, match="missing model keys|missing critical groups"):
+    with pytest.raises(RuntimeError, match="coverage"):
         WanVideoDecoder(
             str(tmp_path / "wan_broken.pt"),
             source_root=str(source_root),

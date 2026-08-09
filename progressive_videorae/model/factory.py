@@ -33,31 +33,49 @@ def build_model(
         checkpoint_path=encoder_checkpoint,
         source_root=encoder_config.get("source_root"),
         input_size=(encoder_config["input_height"], encoder_config["input_width"]),
-        num_frames=video["num_frames"],
+        num_frames=encoder_config.get("max_context_frames", 64),
         patch_size=encoder_config["patch_size"],
         tubelet_size=encoder_config["tubelet_size"],
         output_layers=encoder_config["output_layers"],
         freeze=encoder_config.get("freeze", True),
     )
-    if encoder_config["name"] == "vjepa2_vitl16":
+    encoder_name = encoder_config["name"]
+    legacy_vjepa_variants = {
+        "vjepa2_vitl16": "vitl",
+        "vjepa2_vitg16": "vitg",
+    }
+    if encoder_name == "vjepa2" or encoder_name in legacy_vjepa_variants:
+        variant = legacy_vjepa_variants.get(
+            encoder_name, encoder_config.get("variant", "vitl")
+        )
         encoder = VJEPA2Encoder(
             **common_encoder,
+            variant=variant,
             handle_nonsquare_inputs=encoder_config.get("handle_nonsquare_inputs", True),
         )
-    elif encoder_config["name"] == "videomaev2_vitb":
+    elif encoder_name == "videomaev2_vitb":
         encoder = VideoMAEv2Encoder(
             **common_encoder,
             variant=encoder_config.get("variant", "vit_base_patch16_224"),
         )
     else:
-        raise ValueError(f"Unsupported encoder: {encoder_config['name']}")
+        raise ValueError(f"Unsupported encoder: {encoder_name}")
+
+    encoder_dim = int(encoder.embed_dim)
+    configured_embed_dim = encoder_config.get("embed_dim")
+    if configured_embed_dim is not None and int(configured_embed_dim) != encoder_dim:
+        raise ValueError(
+            f"encoder.embed_dim={configured_embed_dim} does not match "
+            f"{encoder_name} backbone embed_dim={encoder_dim}"
+        )
 
     projector = CausalFrequencyProjector(
-        input_dim=encoder_config["embed_dim"],
+        input_dim=encoder_dim,
         hidden_dim=projector_config["hidden_dim"],
         output_dim=state["channels"],
         num_frames=state["num_frames"],
-        input_frames=video["num_frames"] // encoder_config["tubelet_size"],
+        num_input_layers=len(encoder_config["output_layers"]),
+        max_context_frames=encoder_config.get("max_context_frames", 64),
         height=state["height"],
         width=state["width"],
         depth=projector_config["depth"],
@@ -78,7 +96,7 @@ def build_model(
         encoder,
         projector,
         decoder,
-        encoder_dim=encoder_config["embed_dim"],
+        encoder_dim=encoder_dim,
         decoder_feature_dim=decoder_config["base_dim"] * 4,
     )
     if validate_pretrained:

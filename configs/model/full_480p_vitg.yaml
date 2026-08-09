@@ -6,16 +6,16 @@ video:
 
 encoder:
   name: vjepa2
-  variant: vitl
+  variant: vitg
   source_root: /share/project/liujingyi/progressive_video_rae/third_party/upstream/vjepa2
-  checkpoint_path: /share/project/liujingyi/ckpts/vjepa2/original/model.pth
+  checkpoint_path: /share/project/liujingyi/ckpts/vjepa2/vitg/original/model.pth
   input_height: 480
   input_width: 768
   patch_size: 16
   tubelet_size: 2
   max_context_frames: 64
-  output_layers: [8, 12, 16, 20, 24]
-  embed_dim: 1024
+  output_layers: [8, 16, 24, 32, 40]
+  embed_dim: 1408
   freeze: true
   handle_nonsquare_inputs: true
 

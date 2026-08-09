@@ -3,7 +3,7 @@ import pytest
 torch = pytest.importorskip("torch")
 from torch import nn
 
-from progressive_video_rae.model.wan_decoder import WanVideoDecoder
+from progressive_videorae.model.wan_decoder import WanVideoDecoder
 
 
 class FakeCausalDecoder(nn.Module):

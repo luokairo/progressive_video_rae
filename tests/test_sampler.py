@@ -2,7 +2,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from progressive_video_rae.data.sampler import BalancedHumanNonSpeechSampler
+from progressive_videorae.data.sampler import BalancedHumanNonSpeechSampler
 
 
 class DummyDataset:

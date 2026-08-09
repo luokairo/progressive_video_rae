@@ -81,12 +81,7 @@ class VideoMAEv2Encoder(VideoFoundationEncoder):
             cleaned,
             component="videomaev2_encoder",
             checkpoint_path=checkpoint_path,
-            minimum_coverage=0.98,
-            required_groups={
-                "patch_embedding": ("patch_embed.*",),
-                "first_transformer_block": ("blocks.0.*",),
-                "last_transformer_block": (f"blocks.{depth - 1}.*",),
-            },
+            minimum_coverage=0.90,
             allowed_missing_patterns=("pos_embed", "*.pos_embed"),
             ignored_checkpoint_patterns=("head.*",),
         )

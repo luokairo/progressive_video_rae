@@ -24,14 +24,16 @@ case "${PVR_MODEL}" in
 esac
 
 mkdir -p \
-  "${PVR_CKPT_ROOT}/vjepa2/vitl" \
+  "${PVR_CKPT_ROOT}/vjepa2" \
   "${PVR_CKPT_ROOT}/wan2.2/ti2v_5b" \
   "${PVR_CKPT_ROOT}/videomaev2/vitb" \
   "${PVR_CKPT_ROOT}/evaluation"
 
 download_vjepa2() {
-  wget -c https://dl.fbaipublicfiles.com/vjepa2/vitl.pt \
-    -O "${PVR_CKPT_ROOT}/vjepa2/vitl/vitl.pt"
+  command -v modelscope >/dev/null || { echo "Install modelscope first" >&2; exit 1; }
+  MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/tmp/modelscope-cache}" \
+    modelscope download facebook/vjepa2-vitl-fpc64-256 \
+      --local-dir "${PVR_CKPT_ROOT}/vjepa2"
 }
 
 download_wan() {
@@ -58,6 +60,6 @@ if [[ "${PVR_VERIFY_ONLY}" -eq 0 ]]; then
   [[ "${PVR_MODEL}" == "evaluation" || "${PVR_MODEL}" == "all" ]] && download_evaluation
 fi
 
-python -m progressive_video_rae.tools.validate_checkpoints \
+python -m progressive_videorae.tools.validate_checkpoints \
   --root "${PVR_CKPT_ROOT}" --model "${PVR_MODEL}" --write-sha256
 

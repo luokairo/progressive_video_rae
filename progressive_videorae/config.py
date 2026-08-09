@@ -39,9 +39,15 @@ def load_yaml(path: str | Path) -> dict[str, Any]:
     return OmegaConf.to_container(config, resolve=True)  # type: ignore[return-value]
 
 
-def load_training_bundle(path: str | Path) -> dict[str, Any]:
+def load_training_bundle(
+    path: str | Path, *, model_config_path: str | Path | None = None
+) -> dict[str, Any]:
     training_path = resolve_config_path(path)
     training = load_yaml(training_path)
-    model_path = resolve_config_path(training.pop("model_config"), relative_to=training_path.parent)
+    configured_model_path = training.pop("model_config")
+    model_path = resolve_config_path(
+        model_config_path if model_config_path is not None else configured_model_path,
+        relative_to=training_path.parent,
+    )
     data_path = resolve_config_path(training.pop("data_config"), relative_to=training_path.parent)
     return {"training": training, "model": load_yaml(model_path), "data": load_yaml(data_path)}

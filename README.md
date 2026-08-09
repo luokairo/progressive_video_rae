@@ -32,7 +32,7 @@ source /share/project/liujingyi/activate_conda.sh
 构建 manifest：
 
 ```bash
-python -m progressive_video_rae.data.build_manifest \
+python -m progressive_videorae.data.build_manifest \
   --csv-spec /share/project/liujingyi/progressive_video_rae/data/data_csv.md \
   --output-dir /share/project/liujingyi/progressive_video_rae/data/manifests \
   --split-seed 20260807
@@ -43,7 +43,7 @@ python -m progressive_video_rae.data.build_manifest \
 训练入口：
 
 ```bash
-torchrun --standalone --nproc_per_node=8 -m progressive_video_rae.train \
+torchrun --standalone --nproc_per_node=8 -m progressive_videorae.train \
   --config configs/train/stage1a.yaml
 ```
 
@@ -51,26 +51,39 @@ torchrun --standalone --nproc_per_node=8 -m progressive_video_rae.train \
 
 ```bash
 # Stage 1A：10k full-state warm-up
-torchrun --standalone --nproc_per_node=8 -m progressive_video_rae.train \
+torchrun --standalone --nproc_per_node=8 -m progressive_videorae.train \
   --config configs/train/stage1a.yaml
 
 # Stage 1B：从 1A 权重初始化，重新开始本阶段的 90k step 计数
-torchrun --standalone --nproc_per_node=8 -m progressive_video_rae.train \
+torchrun --standalone --nproc_per_node=8 -m progressive_videorae.train \
   --config configs/train/stage1b.yaml \
   --init-from outputs/stage1a/step_00010000.pt
 
 # Stage 2A：冻结 encoder/projector，训练 decoder 50k
-torchrun --standalone --nproc_per_node=8 -m progressive_video_rae.train \
+torchrun --standalone --nproc_per_node=8 -m progressive_videorae.train \
   --config configs/train/stage2a.yaml \
   --init-from outputs/stage1b/step_00090000.pt
 ```
 
 `--resume` 用于同一阶段中断续训，会恢复 optimizer、scheduler、RNG 和 sampler epoch；跨阶段应使用 `--init-from`，只继承模型与 discriminator 权重。
 
+Stage 1B 默认在一次 gradient accumulation 内交替执行 4 个 random prefix 和 4 个 full micro-batch。`full_objective_weight` 与 `prefix_objective_weight` 是自动归一化的相对权重；例如 `2.0/1.0` 表示 full/prefix 的有效权重为 `2/3` 和 `1/3`，不会改变整体 loss 尺度。
+
+切换到 ViT-g 时覆盖模型配置，并只复用 ViT-L 阶段训练好的 Wan decoder：
+
+```bash
+torchrun --standalone --nproc_per_node=8 -m progressive_videorae.train \
+  --config configs/train/stage1a.yaml \
+  --model-config configs/model/full_480p_vitg.yaml \
+  --init-decoder-from outputs/vitl_stage1b/step_00090000.pt
+```
+
+ViT-L 与 ViT-g 的完整训练 checkpoint 不能相互 `--resume`；冻结的 V-JEPA2 backbone 不写入训练 checkpoint，恢复时从模型配置中的官方权重重新加载。
+
 评估入口：
 
 ```bash
-python -m progressive_video_rae.evaluate \
+python -m progressive_videorae.evaluate \
   --config configs/eval/full_480p.yaml \
   --checkpoint /path/to/checkpoint.pt \
   --output-dir /path/to/eval_output

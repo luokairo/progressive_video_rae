@@ -6,7 +6,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ..model.dct import frequency_leakage
-from ..model.types import EncoderOutput, ProgressiveState
+from ..model.types import EncoderOutput, PrefixEncoderOutput, ProgressiveState
 from ..training.losses import FrozenLPIPS
 
 
@@ -35,10 +35,23 @@ def temporal_l1(prediction: Tensor, target: Tensor) -> Tensor:
     )
 
 
-def encoder_cosine(reference: EncoderOutput, reconstruction: EncoderOutput) -> tuple[Tensor, Tensor]:
-    local = F.cosine_similarity(reference.tokens, reconstruction.tokens, dim=-1).mean()
-    ref_global = reference.tokens.mean(dim=(1, 2, 3))
-    rec_global = reconstruction.tokens.mean(dim=(1, 2, 3))
+def _semantic_tokens(value: Tensor | EncoderOutput | PrefixEncoderOutput) -> Tensor:
+    if isinstance(value, Tensor):
+        return value
+    if isinstance(value, EncoderOutput):
+        return value.tokens
+    return torch.stack([group.tokens.mean(dim=1) for group in value.groups], dim=1)
+
+
+def encoder_cosine(
+    reference: Tensor | EncoderOutput | PrefixEncoderOutput,
+    reconstruction: Tensor | EncoderOutput | PrefixEncoderOutput,
+) -> tuple[Tensor, Tensor]:
+    reference_tokens = _semantic_tokens(reference)
+    reconstruction_tokens = _semantic_tokens(reconstruction)
+    local = F.cosine_similarity(reference_tokens, reconstruction_tokens, dim=-1).mean()
+    ref_global = reference_tokens.mean(dim=(1, 2, 3))
+    rec_global = reconstruction_tokens.mean(dim=(1, 2, 3))
     global_score = F.cosine_similarity(ref_global, rec_global, dim=-1).mean()
     return local, global_score
 

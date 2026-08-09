@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from progressive_video_rae.data.manifest import (
+from progressive_videorae.data.manifest import (
     CsvSource,
     assign_split,
     merge_source_rows,

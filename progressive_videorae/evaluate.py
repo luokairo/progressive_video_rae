@@ -52,11 +52,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate full and prefix Progressive VideoRAE states")
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--model-config", default=None)
     parser.add_argument("--output-dir", required=True)
     args = parser.parse_args()
 
     evaluation = load_yaml(args.config)
-    model_config = load_yaml(resolve_config_path(evaluation["model_config"]))
+    model_config = load_yaml(
+        resolve_config_path(args.model_config or evaluation["model_config"])
+    )
     data_config = load_yaml(resolve_config_path(evaluation["data_config"]))
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +116,7 @@ def main() -> None:
         with torch.inference_mode(), torch.autocast(
             device.type, dtype=precision, enabled=device.type == "cuda"
         ):
-            encoder_output = model.encoder(pixel_values)
+            encoder_output = model.encoder.encode_prefixes(pixel_values)
         if device.type == "cuda":
             torch.cuda.synchronize()
         encoder_seconds = time.perf_counter() - encoder_started
@@ -155,7 +158,7 @@ def main() -> None:
                 with torch.inference_mode(), torch.autocast(
                     device.type, dtype=precision, enabled=device.type == "cuda"
                 ):
-                    reconstructed_features = model.encoder(
+                    reconstructed_features = model.encoder.encode_prefixes(
                         prediction.add(1).mul(0.5).clamp(0, 1)
                     )
                 local, global_score = encoder_cosine(encoder_output, reconstructed_features)

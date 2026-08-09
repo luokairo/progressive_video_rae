@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from progressive_video_rae.model.wan_decoder import WanVideoDecoder
+from progressive_videorae.model.wan_decoder import WanVideoDecoder
 
 
 @pytest.mark.integration

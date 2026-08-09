@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor, nn
@@ -66,31 +65,76 @@ class FrozenLPIPS(nn.Module):
 class LossOutput:
     total: Tensor
     terms: dict[str, Tensor]
+    weighted_terms: dict[str, Tensor] = field(default_factory=dict)
+    statistics: dict[str, Tensor] = field(default_factory=dict)
+
+
+def temporal_l1(prediction: Tensor, target: Tensor) -> Tensor:
+    """Match first-order frame differences without penalizing single-frame clips."""
+
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"Temporal L1 shape mismatch: {tuple(prediction.shape)} vs {tuple(target.shape)}"
+        )
+    if prediction.ndim != 5:
+        raise ValueError(f"Temporal L1 expects [B,C,T,H,W], got {tuple(prediction.shape)}")
+    if prediction.shape[2] < 2:
+        return prediction.sum() * 0.0
+    return F.l1_loss(
+        prediction[:, :, 1:] - prediction[:, :, :-1],
+        target[:, :, 1:] - target[:, :, :-1],
+    )
 
 
 class ProgressiveLosses(nn.Module):
-    def __init__(self, lpips_weight: float = 1.0, adversarial_weight: float = 0.1) -> None:
+    def __init__(
+        self,
+        *,
+        l1_weight: float = 1.0,
+        prefix_lpips_weight: float = 0.5,
+        lpips_weight: float = 1.0,
+        repa_local_weight: float = 1.0,
+        repa_global_weight: float = 1.0,
+        adversarial_weight: float = 0.1,
+        temporal_l1_weight: float = 0.0,
+    ) -> None:
         super().__init__()
         self.lpips = FrozenLPIPS()
-        self.lpips_weight = lpips_weight
-        self.adversarial_weight = adversarial_weight
+        self.l1_weight = float(l1_weight)
+        self.prefix_lpips_weight = float(prefix_lpips_weight)
+        self.lpips_weight = float(lpips_weight)
+        self.repa_local_weight = float(repa_local_weight)
+        self.repa_global_weight = float(repa_global_weight)
+        self.adversarial_weight = float(adversarial_weight)
+        self.temporal_l1_weight = float(temporal_l1_weight)
 
     def prefix(self, output: ProgressiveVideoRAEOutput, target: Tensor) -> LossOutput:
         l1 = F.l1_loss(output.reconstruction, target)
         perceptual = self.lpips(output.reconstruction, target)
-        terms = {"l1": l1, "lpips": perceptual}
-        return LossOutput(total=l1 + 0.5 * self.lpips_weight * perceptual, terms=terms)
+        temporal = temporal_l1(output.reconstruction, target)
+        terms = {"l1": l1, "lpips": perceptual, "temporal_l1": temporal}
+        weighted_terms = {
+            "l1": self.l1_weight * l1,
+            "lpips": self.prefix_lpips_weight * perceptual,
+            "temporal_l1": self.temporal_l1_weight * temporal,
+        }
+        total = sum(weighted_terms.values())
+        return LossOutput(total=total, terms=terms, weighted_terms=weighted_terms)
 
     def full_generator(
         self,
         output: ProgressiveVideoRAEOutput,
         discriminator: nn.Module,
+        *,
+        adversarial_factor: float = 1.0,
     ) -> LossOutput:
         l1 = F.l1_loss(output.reconstruction, output.target)
         perceptual = self.lpips(output.reconstruction, output.target)
         if output.repa_features is None:
             raise RuntimeError("Full-state training requires decoder REPA features")
-        reference = output.encoder_output.tokens.detach()
+        if output.repa_reference is None:
+            raise RuntimeError("Full-state training requires group-aligned REPA targets")
+        reference = output.repa_reference.detach()
         if output.repa_features.shape != reference.shape:
             raise RuntimeError(
                 f"REPA shape mismatch: {tuple(output.repa_features.shape)} vs {tuple(reference.shape)}"
@@ -98,23 +142,33 @@ class ProgressiveLosses(nn.Module):
         local = 1.0 - F.cosine_similarity(output.repa_features, reference, dim=-1).mean()
         predicted_global = output.repa_features.mean(dim=(1, 2, 3))
         reference_global = reference.mean(dim=(1, 2, 3))
-        global_loss = 1.0 - F.cosine_similarity(predicted_global, reference_global, dim=-1).mean()
-        adversarial = -discriminator(output.reconstruction).mean()
+        global_loss = 1.0 - F.cosine_similarity(
+            predicted_global, reference_global, dim=-1
+        ).mean()
+        temporal = temporal_l1(output.reconstruction, output.target)
+        adversarial = (
+            -discriminator(output.reconstruction).mean()
+            if adversarial_factor > 0.0 and self.adversarial_weight > 0.0
+            else output.reconstruction.new_zeros(())
+        )
         terms = {
             "l1": l1,
             "lpips": perceptual,
+            "temporal_l1": temporal,
             "repa_local": local,
             "repa_global": global_loss,
             "adversarial": adversarial,
         }
-        total = (
-            l1
-            + self.lpips_weight * perceptual
-            + local
-            + global_loss
-            + self.adversarial_weight * adversarial
-        )
-        return LossOutput(total=total, terms=terms)
+        weighted_terms = {
+            "l1": self.l1_weight * l1,
+            "lpips": self.lpips_weight * perceptual,
+            "temporal_l1": self.temporal_l1_weight * temporal,
+            "repa_local": self.repa_local_weight * local,
+            "repa_global": self.repa_global_weight * global_loss,
+            "adversarial": self.adversarial_weight * float(adversarial_factor) * adversarial,
+        }
+        total = sum(weighted_terms.values())
+        return LossOutput(total=total, terms=terms, weighted_terms=weighted_terms)
 
     @staticmethod
     def discriminator(
@@ -127,7 +181,14 @@ class ProgressiveLosses(nn.Module):
         real_loss = F.relu(1.0 - real_logits).mean()
         fake_loss = F.relu(1.0 + fake_logits).mean()
         total = 0.5 * (real_loss + fake_loss)
-        return LossOutput(total=total, terms={"disc_real": real_loss, "disc_fake": fake_loss})
+        return LossOutput(
+            total=total,
+            terms={"disc_real": real_loss, "disc_fake": fake_loss, "disc_total": total},
+            statistics={
+                "real_logits": real_logits,
+                "fake_logits": fake_logits,
+            },
+        )
 
 
 def scalar_terms(terms: dict[str, Tensor]) -> dict[str, float]:

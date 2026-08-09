@@ -3,7 +3,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("torch_dct")
 
-from progressive_video_rae.model.dct import dct_lowpass_target, frequency_cutoff
+from progressive_videorae.model.dct import dct_lowpass_target, frequency_cutoff
 
 
 def test_prefix_64_is_full_frequency_roundtrip():

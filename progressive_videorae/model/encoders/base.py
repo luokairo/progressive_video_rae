@@ -35,10 +35,16 @@ def upstream_import_path(source_root: str | Path | None) -> Iterator[None]:
 
 def clean_state_dict_keys(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
     cleaned: dict[str, Tensor] = {}
+    prefixes = ("module.", "backbone.", "encoder.")
     for key, value in state_dict.items():
-        for prefix in ("module.", "backbone.", "encoder."):
-            if key.startswith(prefix):
-                key = key[len(prefix) :]
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                if key.startswith(prefix):
+                    key = key[len(prefix) :]
+                    changed = True
+                    break
         cleaned[key] = value
     return cleaned
 

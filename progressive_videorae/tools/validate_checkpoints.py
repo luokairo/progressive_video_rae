@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 EXPECTED = {
-    "vjepa2": ("vjepa2/vitl/vitl.pt", 1_000_000),
+    "vjepa2": (("vjepa2/original/model.pth", "vjepa2/vitl/vitl.pt", "vjepa2/vitl/original/model.pth"), 1_000_000),
     "wan2.2": ("wan2.2/ti2v_5b/Wan2.2_VAE.pth", 1_000_000),
     "videomaev2": ("videomaev2/vitb/distill/vit_b_k710_dl_from_giant.pth", 1_000_000),
     "evaluation": ("evaluation/i3d_torchscript.pt", 100_000),
@@ -67,10 +67,12 @@ def validate_checkpoint_structure(model: str, path: Path) -> None:
 def validate(root: Path, models: list[str], write_sha256: bool) -> None:
     failures = []
     for model in models:
-        relative, minimum_size = EXPECTED[model]
-        path = root / relative
-        if not path.is_file():
-            failures.append(f"missing: {path}")
+        candidates, minimum_size = EXPECTED[model]
+        if isinstance(candidates, str):
+            candidates = (candidates,)
+        path = next((root / candidate for candidate in candidates if (root / candidate).is_file()), None)
+        if path is None:
+            failures.append(f"missing: one of {', '.join(str(root / candidate) for candidate in candidates)}")
             continue
         size = path.stat().st_size
         if size < minimum_size:
