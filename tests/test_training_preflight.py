@@ -13,6 +13,7 @@ from progressive_videorae.training.checkpoint import (
     load_decoder_from_checkpoint,
     load_model_state,
 )
+from progressive_videorae.model.types import StateContract
 
 
 class StubModel:
@@ -58,6 +59,7 @@ class TinyTrainingModel(nn.Module):
         self.encoder.frozen = True
         self.projector = nn.Linear(encoder_dim, 2)
         self.decoder = nn.Linear(2, 2)
+        self.state_contract = StateContract()
 
 
 def test_checkpoint_state_excludes_frozen_encoder_and_restores_external_encoder():
@@ -84,7 +86,7 @@ def test_decoder_only_initialization_does_not_replace_encoder_or_projector(tmp_p
         target.projector.weight.fill_(5.0)
         target.decoder.weight.fill_(6.0)
     checkpoint_path = tmp_path / "vitl_training.pt"
-    torch.save({"model": source.state_dict()}, checkpoint_path)
+    torch.save({"model": source.state_dict(), "state_contract": source.state_contract.to_dict()}, checkpoint_path)
 
     load_decoder_from_checkpoint(checkpoint_path, model=target)
 

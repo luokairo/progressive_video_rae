@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 import random
 
@@ -8,7 +9,71 @@ from torch import nn
 from ..model.model import ProgressiveVideoRAE
 
 
-STAGES = ("stage1a", "stage1b", "stage2a")
+STAGES = ("stage1a", "stage1b", "stage2a", "stage2b")
+OBJECTIVE_MODES = {
+    "stage1a": "full_repa",
+    "stage1b": "full_repa_spatial_prefix",
+    "stage2a": "full_repa",
+    "stage2b": "full_repa_stateful",
+}
+PREFIX_CONFIG_KEYS = {
+    "prefix_schedule",
+    "prefix_min",
+    "prefix_max",
+    "prefix_objective_weight",
+    "prefix_lpips_weight",
+    "full_microbatches_per_step",
+}
+
+STAGE1B_PREFIX_SCHEDULE = "fixed_4_full_3_single_1_pair"
+STAGE1A_PHASES = ("warmup", "interface", "full")
+
+
+def stage1a_phase(
+    optimizer_step: int,
+    *,
+    wan_interface_step: int = 2000,
+    wan_full_step: int = 5000,
+) -> str:
+    if not 0 <= wan_interface_step <= wan_full_step:
+        raise ValueError("Stage 1A boundaries must satisfy 0 <= interface <= full")
+    if optimizer_step < wan_interface_step:
+        return "warmup"
+    if optimizer_step < wan_full_step:
+        return "interface"
+    return "full"
+
+
+@dataclass(frozen=True)
+class MicrobatchTask:
+    kind: str  # full, single_prefix, paired_prefix
+    endpoint: int = 47
+    previous_endpoint: int | None = None
+
+    @property
+    def is_full(self) -> bool:
+        return self.kind == "full"
+
+
+def validate_stage_objective(config: dict) -> str:
+    stage = str(config.get("stage"))
+    if stage not in STAGES:
+        raise ValueError(f"Unsupported stage {stage}; expected one of {STAGES}")
+    expected = OBJECTIVE_MODES[stage]
+    if config.get("objective_mode") != expected:
+        raise ValueError(f"{stage} requires objective_mode={expected}")
+    if stage in ("stage2a", "stage2b"):
+        forbidden = sorted(PREFIX_CONFIG_KEYS.intersection(config))
+        if forbidden:
+            raise ValueError(f"{stage} forbids spatial-prefix configuration: {forbidden}")
+    if stage == "stage1b":
+        if config.get("prefix_schedule") != STAGE1B_PREFIX_SCHEDULE:
+            raise ValueError(f"stage1b requires prefix_schedule={STAGE1B_PREFIX_SCHEDULE}")
+        if int(config.get("gradient_accumulation_steps", 0)) != 8:
+            raise ValueError("stage1b requires gradient_accumulation_steps=8")
+        if int(config.get("full_microbatches_per_step", 0)) != 4:
+            raise ValueError("stage1b requires full_microbatches_per_step=4")
+    return expected
 
 
 def _set_trainable(module: nn.Module, trainable: bool) -> None:
@@ -16,133 +81,75 @@ def _set_trainable(module: nn.Module, trainable: bool) -> None:
     module.train(trainable)
 
 
-def configure_stage(model: ProgressiveVideoRAE, stage: str) -> None:
+def configure_stage(
+    model: ProgressiveVideoRAE,
+    stage: str,
+    *,
+    optimizer_step: int = 0,
+    wan_interface_step: int = 2000,
+    wan_full_step: int = 5000,
+) -> None:
     if stage not in STAGES:
         raise ValueError(f"Unsupported stage {stage}; expected one of {STAGES}")
     _set_trainable(model.encoder, False)
     if stage in ("stage1a", "stage1b"):
         _set_trainable(model.projector, True)
-        _set_trainable(model.decoder, True)
         _set_trainable(model.repa_projection, True)
+        if stage == "stage1a":
+            model.projector.shared_mask_set.requires_grad_(False)
     else:
         _set_trainable(model.projector, False)
-        _set_trainable(model.decoder, True)
         _set_trainable(model.repa_projection, False)
 
+    if stage != "stage1a":
+        _set_trainable(model.decoder, True)
+        return
 
-def sample_prefix(
+    phase = stage1a_phase(
+        optimizer_step,
+        wan_interface_step=wan_interface_step,
+        wan_full_step=wan_full_step,
+    )
+    _set_trainable(model.decoder, False)
+    _set_trainable(model.decoder.temporal_adapter, True)
+    if phase in ("interface", "full"):
+        _set_trainable(model.decoder.pre_decoder, True)
+        _set_trainable(model.decoder.decoder.conv1, True)
+        for name, module in model.decoder.decoder.named_modules():
+            if name.endswith("time_conv"):
+                _set_trainable(module, True)
+    if phase == "full":
+        _set_trainable(model.decoder, True)
+
+
+def _cosine_endpoint(minimum: int, maximum: int) -> int:
+    endpoints = list(range(minimum, maximum + 1))
+    denominator = max(1, maximum - minimum)
+    weights = [1.5 + 0.5 * math.cos(math.pi * (s - minimum) / denominator) for s in endpoints]
+    return random.choices(endpoints, weights=weights, k=1)[0]
+
+
+def sample_microbatch_tasks(
     stage: str,
-    optimizer_step: int,
-    minimum: int = 1,
-    maximum: int = 63,
-    *,
-    schedule: str | None = None,
-    full_probability: float = 0.5,
-) -> int:
-    schedule = schedule or ("full" if stage in ("stage1a", "stage2a") else "alternating")
-    if schedule == "full":
-        return 64
-    if schedule == "alternating" and optimizer_step % 2 == 0:
-        return 64
-    if schedule == "random":
-        if not 0.0 <= full_probability <= 1.0:
-            raise ValueError("full_probability must be in [0, 1]")
-        if random.random() < full_probability:
-            return 64
-    elif schedule != "alternating":
-        raise ValueError("prefix schedule must be full, alternating, or random")
-    if minimum < 1 or maximum > 63 or minimum > maximum:
-        raise ValueError("prefix range must satisfy 1 <= minimum <= maximum <= 63")
-    return random.randint(minimum, maximum)
-
-
-def normalize_objective_weights(
-    full_weight: float, prefix_weight: float
-) -> tuple[float, float]:
-    full = float(full_weight)
-    prefix = float(prefix_weight)
-    if not math.isfinite(full) or not math.isfinite(prefix):
-        raise ValueError("Objective weights must be finite")
-    if full < 0.0 or prefix < 0.0:
-        raise ValueError("Objective weights must be non-negative")
-    total = full + prefix
-    if total <= 0.0:
-        raise ValueError("full_objective_weight and prefix_objective_weight cannot both be zero")
-    return full / total, prefix / total
-
-
-def sample_microbatch_prefixes(
-    stage: str,
-    optimizer_step: int,
     accumulation_steps: int,
-    minimum: int = 1,
-    maximum: int = 63,
     *,
-    schedule: str | None = None,
-    full_probability: float = 0.5,
-    full_microbatches_per_step: int | None = None,
-) -> tuple[int, ...]:
-    """Build one rank-local prefix plan for a generator optimizer step."""
-
-    if accumulation_steps <= 0:
-        raise ValueError("gradient_accumulation_steps must be positive")
-    resolved_schedule = schedule or (
-        "full" if stage in ("stage1a", "stage2a") else "alternating"
+    optimizer_step: int = 0,
+) -> tuple[MicrobatchTask, ...]:
+    if stage in ("stage1a", "stage2a", "stage2b"):
+        return tuple(MicrobatchTask("full") for _ in range(accumulation_steps))
+    if stage != "stage1b":
+        raise ValueError(f"Unsupported stage: {stage}")
+    if accumulation_steps != 8:
+        raise ValueError("Stage 1B requires exactly 8 microbatches per optimizer step")
+    tasks = [MicrobatchTask("full") for _ in range(4)]
+    tasks.extend(
+        MicrobatchTask("single_prefix", _cosine_endpoint(0, 46))
+        for _ in range(3)
     )
-    if resolved_schedule != "mixed_accumulation":
-        prefix = sample_prefix(
-            stage,
-            optimizer_step,
-            minimum,
-            maximum,
-            schedule=resolved_schedule,
-            full_probability=full_probability,
-        )
-        return (prefix,) * accumulation_steps
-
-    full_count = (
-        accumulation_steps // 2
-        if full_microbatches_per_step is None
-        else int(full_microbatches_per_step)
-    )
-    if accumulation_steps % 2 != 0 or full_count * 2 != accumulation_steps:
-        raise ValueError(
-            "mixed_accumulation currently requires an even accumulation count "
-            "and exactly half full micro-batches"
-        )
-    if minimum < 1 or maximum > 63 or minimum > maximum:
-        raise ValueError("prefix range must satisfy 1 <= minimum <= maximum <= 63")
-    return tuple(
-        64 if micro_step % 2 == 1 else random.randint(minimum, maximum)
-        for micro_step in range(accumulation_steps)
-    )
-
-
-def objective_loss_scales(
-    prefix_lengths: tuple[int, ...],
-    full_weight: float,
-    prefix_weight: float,
-) -> tuple[tuple[float, ...], tuple[float, float]]:
-    """Return per-micro loss scales and the effective full/prefix task weights."""
-
-    normalized_full, normalized_prefix = normalize_objective_weights(
-        full_weight, prefix_weight
-    )
-    full_count = sum(prefix == 64 for prefix in prefix_lengths)
-    prefix_count = len(prefix_lengths) - full_count
-    if full_count and prefix_count:
-        scales = tuple(
-            normalized_full / full_count
-            if prefix == 64
-            else normalized_prefix / prefix_count
-            for prefix in prefix_lengths
-        )
-        return scales, (normalized_full, normalized_prefix)
-    if full_count:
-        return tuple(1.0 / full_count for _ in prefix_lengths), (1.0, 0.0)
-    if prefix_count:
-        return tuple(1.0 / prefix_count for _ in prefix_lengths), (0.0, 1.0)
-    raise ValueError("At least one micro-batch is required")
+    endpoint = _cosine_endpoint(1, 47)
+    tasks.append(MicrobatchTask("paired_prefix", endpoint, endpoint - 1))
+    random.shuffle(tasks)
+    return tuple(tasks)
 
 
 def adversarial_factor(optimizer_step: int, start_step: int, ramp_steps: int) -> float:
@@ -153,4 +160,3 @@ def adversarial_factor(optimizer_step: int, start_step: int, ramp_steps: int) ->
     if ramp_steps == 0:
         return 1.0
     return min(1.0, max(0.0, (optimizer_step - start_step) / ramp_steps))
-

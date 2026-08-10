@@ -10,12 +10,13 @@ from typing import Any, Literal
 import torch
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
-
 from .pretrained import PretrainedLoadReport, load_validated_pretrained
+from .progressive_sets import build_progressive_layout
 from .types import (
     IMAGE_FIRST_ID,
     VIDEO_GROUP_ID,
     ProgressiveState,
+    SpatialPrefixView,
     StateContract,
 )
 
@@ -59,6 +60,8 @@ class RAECausalResidualBlock(nn.Module):
         self.conv = nn.Conv3d(channels, channels, (3, 1, 1))
         self.activation = nn.SiLU()
         self.projection = nn.Conv3d(channels, channels, 1)
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
 
     def forward(self, x: Tensor) -> Tensor:
         hidden = torch.nn.functional.pad(self.norm(x), (0, 0, 0, 0, 2, 0))
@@ -82,11 +85,11 @@ class RAETemporalAdapter(nn.Module):
             RAECausalResidualBlock(channels),
             RAECausalResidualBlock(channels),
         )
-        self.image_head = nn.Conv3d(channels, channels, 1)
-        self.video_head = nn.Conv3d(channels, channels * 4, 1)
-        self.phase_embedding = nn.Parameter(torch.zeros(4, channels))
         self.state_to_wan = nn.Conv3d(channels, channels, 1)
-        nn.init.trunc_normal_(self.phase_embedding, std=0.02)
+        nn.init.zeros_(self.state_to_wan.weight)
+        with torch.no_grad():
+            self.state_to_wan.weight[:, :, 0, 0, 0].copy_(torch.eye(channels))
+        nn.init.zeros_(self.state_to_wan.bias)
 
     def forward(
         self,
@@ -103,33 +106,29 @@ class RAETemporalAdapter(nn.Module):
         history = None if cache is None else cache.raw_history
         combined = state if history is None else torch.cat((history.to(state), state), dim=2)
         hidden = self.blocks(combined)[:, :, -state.shape[2] :]
-        expanded: list[Tensor] = []
-        for index, latent_type in enumerate(latent_types.tolist()):
-            current = hidden[:, :, index : index + 1]
-            if latent_type == IMAGE_FIRST_ID:
-                expanded.append(self.image_head(current))
-            elif latent_type == VIDEO_GROUP_ID:
-                phases = self.video_head(current)
-                b, _, _, h, w = phases.shape
-                phases = phases.reshape(b, 4, self.channels, h, w).permute(0, 2, 1, 3, 4)
-                phases = phases + self.phase_embedding.T.view(1, self.channels, 4, 1, 1)
-                expanded.append(phases)
-            else:
+        for latent_type in latent_types.tolist():
+            if latent_type not in (IMAGE_FIRST_ID, VIDEO_GROUP_ID):
                 raise ValueError(f"Unsupported latent type id: {latent_type}")
-        output = self.state_to_wan(torch.cat(expanded, dim=2))
+        output = self.state_to_wan(hidden)
 
         if cache is not None:
-            cache.raw_history = combined[:, :, -self.history_latents :].detach()
+            history = combined[:, :, -self.history_latents :]
+            cache.raw_history = history if self.training else history.detach()
         return output, cache
 
 
 @dataclass
 class WanCacheState:
     features: list[Any]
-    frames_seen: int = 0
+    latents_seen: int = 0
     rae: RAETemporalCache | None = None
     sequence_id: str | None = None
     contract_version: str | None = None
+    codec_id: str | None = None
+    decoder_id: str | None = None
+    batch_size: int | None = None
+    dtype: torch.dtype | None = None
+    device: torch.device | None = None
 
 
 @dataclass
@@ -161,7 +160,7 @@ class WanLoadReport:
 
 
 class WanVideoDecoder(nn.Module):
-    """RAE-owned group expansion followed by a Wan spatial/causal-conv backend."""
+    """RAE latent-causal bridge followed by Wan's native temporal decoder."""
 
     def __init__(
         self,
@@ -197,7 +196,8 @@ class WanVideoDecoder(nn.Module):
             dim_mult=[1, 2, 4, 4],
             num_res_blocks=2,
             attn_scales=[],
-            temperal_upsample=[False, False, False],
+            # Wan2_2_VAE uses downsample=[False,True,True] and reverses it for decode.
+            temperal_upsample=[True, True, False],
             dropout=0.0,
         )
         self._count_conv3d = module.count_conv3d
@@ -209,6 +209,13 @@ class WanVideoDecoder(nn.Module):
             width=output_size[1] // 16,
             channels=latent_channels,
         )
+        layout = build_progressive_layout(self.contract.height, self.contract.width)
+        inverse = torch.empty(len(layout.traversal), dtype=torch.long)
+        traversal = torch.tensor(layout.traversal, dtype=torch.long)
+        inverse[traversal] = torch.arange(traversal.numel())
+        self.register_buffer("inverse_fps_permutation", inverse, persistent=True)
+        self.codec_id = "candidate_v3_unfrozen"
+        self.decoder_id = "wan22_native_r4_bridge_v1"
         self.gradient_checkpointing = False
         self.register_buffer(
             "latent_mean", torch.tensor(WAN22_LATENT_MEAN).view(1, 48, 1, 1, 1), persistent=True
@@ -243,27 +250,31 @@ class WanVideoDecoder(nn.Module):
             conv_state,
             component="wan2.2_pre_decoder",
             checkpoint_path=checkpoint_path,
-            minimum_coverage=0.90,
+            minimum_coverage=0.99,
         )
         decoder_report = load_validated_pretrained(
             self.decoder,
             decoder_state,
             component="wan2.2_decoder",
             checkpoint_path=checkpoint_path,
-            minimum_coverage=0.90,
-            ignored_checkpoint_patterns=("*time_conv*",),
+            minimum_coverage=0.99,
         )
         report = WanLoadReport(decoder=decoder_report, pre_decoder=pre_decoder_report)
         report.assert_ready()
         return report
 
-    def _new_cache(self, *, sequence_id: str | None) -> WanCacheState:
+    def _new_cache(self, canonical: Tensor, *, sequence_id: str | None) -> WanCacheState:
         return WanCacheState(
             features=[None] * int(self._count_conv3d(self.decoder)),
-            frames_seen=0,
+            latents_seen=0,
             rae=RAETemporalCache(),
             sequence_id=sequence_id,
             contract_version=self.contract.version,
+            codec_id=self.codec_id,
+            decoder_id=self.decoder_id,
+            batch_size=int(canonical.shape[0]),
+            dtype=canonical.dtype,
+            device=canonical.device,
         )
 
     def enable_gradient_checkpointing(self, enabled: bool = True) -> None:
@@ -271,15 +282,15 @@ class WanVideoDecoder(nn.Module):
 
     def _canonical_tokens(
         self,
-        state: ProgressiveState | Tensor,
+        state: ProgressiveState | SpatialPrefixView | Tensor,
         latent_types: Tensor | None,
         *,
         cache_mode: CacheMode,
     ) -> tuple[Tensor, Tensor]:
-        tokens = state.tokens if isinstance(state, ProgressiveState) else state
-        if tokens.ndim != 5 or tokens.shape[-1] != 48:
-            raise ValueError(f"Expected state [B,T,H,W,48], got {tuple(tokens.shape)}")
-        if isinstance(state, ProgressiveState):
+        tokens = state.tokens if isinstance(state, (ProgressiveState, SpatialPrefixView)) else state
+        if tokens.ndim != 5 or tuple(tokens.shape[2:]) != (48, 30, 48):
+            raise ValueError(f"Expected ordered state [B,T,48,30,48], got {tuple(tokens.shape)}")
+        if isinstance(state, (ProgressiveState, SpatialPrefixView)):
             if state.contract is None:
                 raise ValueError("ProgressiveState must carry a StateContract")
             self.contract.assert_compatible(state.contract)
@@ -291,7 +302,12 @@ class WanVideoDecoder(nn.Module):
             )
             if cache_mode != "reuse" and tokens.shape[1] > 1:
                 latent_types[1:] = VIDEO_GROUP_ID
-        return tokens.permute(0, 4, 1, 2, 3), latent_types.to(tokens.device)
+        b, t, _, _, c = tokens.shape
+        ordered = tokens.reshape(b, t, self.contract.height * self.contract.width, c)
+        grid = ordered.index_select(2, self.inverse_fps_permutation).reshape(
+            b, t, self.contract.height, self.contract.width, c
+        )
+        return grid.permute(0, 4, 1, 2, 3), latent_types.to(tokens.device)
 
     def _prepare_wan_latent(
         self,
@@ -308,9 +324,8 @@ class WanVideoDecoder(nn.Module):
 
     def decode(
         self,
-        state: ProgressiveState | Tensor,
+        state: ProgressiveState | SpatialPrefixView | Tensor,
         *,
-        prefix_len: int = 64,
         cache_mode: CacheMode = "disabled",
         cache_state: WanCacheState | None = None,
         latent_types: Tensor | None = None,
@@ -319,15 +334,13 @@ class WanVideoDecoder(nn.Module):
     ) -> WanDecoderOutput:
         if cache_mode not in ("disabled", "reset", "reuse"):
             raise ValueError(f"Unsupported cache_mode: {cache_mode}")
-        if isinstance(state, ProgressiveState) and prefix_len != state.prefix_len:
-            raise ValueError("prefix_len does not match ProgressiveState.prefix_len")
         canonical, latent_types = self._canonical_tokens(
             state, latent_types, cache_mode=cache_mode
         )
         if cache_mode == "reset":
             if latent_types[0].item() != IMAGE_FIRST_ID:
                 raise ValueError("cache reset must begin with an image_first latent")
-            cache_state = self._new_cache(sequence_id=sequence_id)
+            cache_state = self._new_cache(canonical, sequence_id=sequence_id)
         elif cache_mode == "reuse":
             if cache_state is None:
                 raise ValueError("cache_mode='reuse' requires cache_state from a prior decode call")
@@ -337,6 +350,14 @@ class WanVideoDecoder(nn.Module):
                 raise ValueError("cache_state belongs to a different sequence_id")
             if cache_state.contract_version != self.contract.version:
                 raise ValueError("cache_state StateContract version mismatch")
+            if cache_state.codec_id != self.codec_id or cache_state.decoder_id != self.decoder_id:
+                raise ValueError("cache_state codec/decoder identity mismatch")
+            if cache_state.batch_size != canonical.shape[0]:
+                raise ValueError("cache_state batch size mismatch")
+            if cache_state.dtype != canonical.dtype or cache_state.device != canonical.device:
+                raise ValueError("cache_state dtype/device mismatch")
+        else:
+            cache_state = self._new_cache(canonical, sequence_id=sequence_id)
         latent = self._prepare_wan_latent(
             canonical,
             latent_types,
@@ -345,37 +366,50 @@ class WanVideoDecoder(nn.Module):
         captured: list[Tensor] = []
         hook = None
         if return_features:
-            hook = self.decoder.upsamples[0].register_forward_hook(
-                lambda _module, _inputs, output: captured.append(output)
+            # Capture one feature per input latent before Wan's first native temporal
+            # upsample. A post-hook here would produce 1/2 temporal positions and
+            # silently break the one-REPA-position-per-latent contract.
+            hook = self.decoder.upsamples[0].register_forward_pre_hook(
+                lambda _module, inputs: captured.append(inputs[0])
             )
         try:
-            if cache_mode == "disabled":
-                if self.gradient_checkpointing and self.training:
-                    decoded = checkpoint(
-                        lambda value: self.decoder(
-                            value, feat_cache=None, feat_idx=[0], first_chunk=True
-                        ),
-                        latent,
-                        use_reentrant=False,
-                    )
+            assert cache_state is not None
+            outputs = []
+            for latent_index in range(latent.shape[2]):
+                latent_chunk = latent[:, :, latent_index : latent_index + 1]
+                first_chunk = cache_state.latents_seen == 0
+                if self.training and self.gradient_checkpointing and latent_chunk.requires_grad:
+                    cache_inputs = tuple(cache_state.features)
+                    forward_cache: dict[str, list[Any]] = {}
+
+                    def decode_chunk(
+                        current: Tensor,
+                        cache_inputs: tuple[Any, ...] = cache_inputs,
+                        first_chunk: bool = first_chunk,
+                    ) -> Tensor:
+                        local_cache = list(cache_inputs)
+                        output = self.decoder(
+                            current,
+                            feat_cache=local_cache,
+                            feat_idx=[0],
+                            first_chunk=first_chunk,
+                        )
+                        forward_cache["features"] = local_cache
+                        return output
+
+                    output = checkpoint(decode_chunk, latent_chunk, use_reentrant=False)
+                    cache_state.features = forward_cache["features"]
                 else:
-                    decoded = self.decoder(latent, feat_cache=None, feat_idx=[0], first_chunk=True)
-                result_cache = None
-            else:
-                assert cache_state is not None
-                outputs = []
-                for frame_index in range(latent.shape[2]):
-                    feat_index = [0]
                     output = self.decoder(
-                        latent[:, :, frame_index : frame_index + 1],
+                        latent_chunk,
                         feat_cache=cache_state.features,
-                        feat_idx=feat_index,
-                        first_chunk=cache_state.frames_seen == 0,
+                        feat_idx=[0],
+                        first_chunk=first_chunk,
                     )
-                    outputs.append(output)
-                    cache_state.frames_seen += 1
-                decoded = torch.cat(outputs, dim=2)
-                result_cache = cache_state
+                outputs.append(output)
+                cache_state.latents_seen += 1
+            decoded = torch.cat(outputs, dim=2)
+            result_cache = None if cache_mode == "disabled" else cache_state
         finally:
             if hook is not None:
                 hook.remove()

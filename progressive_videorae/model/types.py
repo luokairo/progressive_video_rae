@@ -47,17 +47,21 @@ class PrefixEncoderOutput:
         return len(self.groups)
 
 
+
 @dataclass(frozen=True)
 class StateContract:
     """Versioned production-state contract shared by RAE, NOVA, and decoders."""
 
-    version: str = "native_vjepa_prefix_r4_v1"
+    version: str = "native_vjepa_prefix_r4_v3"
     temporal_mode: str = "native_vjepa_prefix_r4"
-    decoder_mode: str = "rae_group_expand_wan_spatial"
+    decoder_mode: str = "rae_latent_causal_bridge_wan_native_r4"
+    spatial_prefix_fill: str = "shared_zero_init_learnable_mask_v1"
+    layout_version: str = "fps_v2_h30_w48_s48_k30"
     height: int = 30
     width: int = 48
     channels: int = 48
-    num_sets: int = 64
+    num_sets: int = 48
+    tokens_per_set: int = 30
     max_encoder_context_frames: int = 64
     first_latent_rgb_frames: int = 1
     continuation_latent_rgb_frames: int = 4
@@ -84,22 +88,17 @@ class StateContract:
 
 @dataclass
 class ProgressiveState:
-    """Fixed-layout continuous state consumed by the Wan decoder."""
+    """Complete production state. It never contains spatial-prefix mask tokens."""
 
-    tokens: Tensor  # [B, T, H, W, C]
-    flat_tokens: Tensor  # [B, T, H*W, C]
-    set_ids: Tensor  # [H, W]
-    set_sizes: Tensor  # [num_sets]
-    prefix_len: int
+    tokens: Tensor  # [B, T, S, K, C]
     layout_version: str
     layout_checksum: str
-    metadata: dict[str, Any] | None = None
     latent_types: Tensor | None = None  # [T], IMAGE_FIRST_ID or VIDEO_GROUP_ID
     contract: StateContract | None = None
 
     def __post_init__(self) -> None:
         if self.tokens.ndim != 5:
-            raise ValueError(f"ProgressiveState.tokens must be [B,T,H,W,C], got {self.tokens.shape}")
+            raise ValueError(f"ProgressiveState.tokens must be [B,T,S,K,C], got {self.tokens.shape}")
         if self.latent_types is not None:
             if self.latent_types.ndim != 1 or self.latent_types.numel() != self.tokens.shape[1]:
                 raise ValueError("latent_types must have shape [T]")
@@ -110,14 +109,71 @@ class ProgressiveState:
                 raise ValueError("latent_types contains an unsupported value")
         if self.contract is not None:
             expected = (
-                self.contract.height,
-                self.contract.width,
+                self.contract.num_sets,
+                self.contract.tokens_per_set,
                 self.contract.channels,
             )
             if tuple(self.tokens.shape[2:]) != expected:
                 raise ValueError(
                     f"State shape {tuple(self.tokens.shape[2:])} violates contract {expected}"
                 )
+
+    @property
+    def full_endpoint(self) -> int:
+        if self.contract is None:
+            raise ValueError("ProgressiveState must carry a StateContract")
+        return self.contract.num_sets - 1
+
+
+@dataclass
+class SpatialPrefixView:
+    """Dense masked training view; it is never a canonical production state."""
+
+    tokens: Tensor  # [B, T, S, K, C]
+    endpoint: int
+    source: ProgressiveState | None = None
+    latent_types: Tensor | None = None
+    contract: StateContract | None = None
+    layout_version: str | None = None
+    layout_checksum: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.source is not None:
+            if self.tokens.shape != self.source.tokens.shape:
+                raise ValueError("SpatialPrefixView must preserve the canonical state shape")
+            if self.latent_types is None:
+                self.latent_types = self.source.latent_types
+            if self.contract is None:
+                self.contract = self.source.contract
+            if self.layout_version is None:
+                self.layout_version = self.source.layout_version
+            if self.layout_checksum is None:
+                self.layout_checksum = self.source.layout_checksum
+        if self.contract is None:
+            raise ValueError("SpatialPrefixView must carry a StateContract")
+        expected = (
+            self.contract.num_sets,
+            self.contract.tokens_per_set,
+            self.contract.channels,
+        )
+        if self.tokens.ndim != 5 or tuple(self.tokens.shape[2:]) != expected:
+            raise ValueError(f"SpatialPrefixView shape must end in {expected}")
+        if not 0 <= self.endpoint < self.contract.num_sets - 1:
+            raise ValueError("SpatialPrefixView endpoint must be in [0, num_sets-2]")
+
+
+@dataclass(frozen=True)
+class RepaReference:
+    anchor: Tensor  # [B, 1, H, W, C]
+    video_phases: Tensor  # [B, G, 2, H, W, C]
+
+
+@dataclass(frozen=True)
+class ProjectorOutput:
+    state: ProgressiveState
+    repa_reference: RepaReference
+    prefix_windows: tuple[tuple[int, int, int], ...]
+
 
 
 def assert_video_tensor(pixel_values: Tensor, *, frames: int, height: int, width: int) -> None:

@@ -1,8 +1,8 @@
 model_config: configs/model/full_480p.yaml
-data_config: configs/data/default_17f.yaml
-stage: stage2a
-objective_mode: full_repa
-max_steps: 50000
+data_config: configs/data/continuous_33f.yaml
+stage: stage2b
+objective_mode: full_repa_stateful
+max_steps: 20000
 global_batch_size: 64
 micro_batch_size: 1
 gradient_accumulation_steps: 8
@@ -23,6 +23,6 @@ repa_global_weight: 1.0
 adversarial_weight: 0.1
 disc_start: 0
 adversarial_ramp_steps: 0
-output_dir: outputs/stage2a
+output_dir: outputs/stage2b
 save_every: 1000
 log_every: 10

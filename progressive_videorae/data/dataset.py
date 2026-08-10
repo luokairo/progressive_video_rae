@@ -115,6 +115,19 @@ class VideoManifestDataset(Dataset):
         except ImportError as exc:
             raise ImportError("Install pandas and pyarrow to load manifests") from exc
         self.frame = pd.read_parquet(manifest_path).reset_index(drop=True)
+        minimum_duration = (num_frames - 1) / target_fps
+        if "path_exists" in self.frame:
+            self.frame = self.frame[self.frame["path_exists"].fillna(False)]
+        if "decode_valid" in self.frame:
+            self.frame = self.frame[self.frame["decode_valid"].fillna(False)]
+        if "duration" in self.frame:
+            duration = self.frame["duration"]
+            self.frame = self.frame[duration.isna() | (duration >= minimum_duration - 1e-6)]
+        self.frame = self.frame.reset_index(drop=True)
+        if self.frame.empty:
+            raise ValueError(
+                f"No videos can provide {num_frames} frames at {target_fps} FPS"
+            )
         self.config = VideoSamplingConfig(
             num_frames=num_frames,
             target_fps=target_fps,
@@ -124,11 +137,6 @@ class VideoManifestDataset(Dataset):
             horizontal_flip=horizontal_flip,
         )
         self.max_decode_retries = max_decode_retries
-        self.categories = self.frame["category"].astype(str).tolist()
-        self.category_to_indices = {
-            category: [index for index, value in enumerate(self.categories) if value == category]
-            for category in ("human", "non_speech")
-        }
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -136,9 +144,7 @@ class VideoManifestDataset(Dataset):
     def _candidate_index(self, index: int, attempt: int) -> int:
         if attempt == 0:
             return index
-        category = self.categories[index]
-        pool = self.category_to_indices[category]
-        return pool[(pool.index(index) + 104729 * attempt) % len(pool)]
+        return (index + 104729 * attempt) % len(self.frame)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         last_error: Exception | None = None

@@ -68,17 +68,16 @@ def effective_rank(matrix: Tensor, eps: float = 1e-8) -> Tensor:
 def state_set_statistics(
     state: ProgressiveState, collapse_threshold: float = 1e-4
 ) -> list[dict[str, float]]:
-    source = (state.metadata or {}).get("unmasked_tokens", state.tokens)
+    source = state.tokens
     rows = []
-    for set_id in range(len(state.set_sizes)):
-        mask = state.set_ids == set_id
-        values = source[:, :, mask, :].reshape(-1, source.shape[-1])
+    for set_id in range(source.shape[2]):
+        values = source[:, :, set_id].reshape(-1, source.shape[-1])
         variance = values.float().var(dim=0, unbiased=False).mean()
         centered = values.float() - values.float().mean(dim=0, keepdim=True)
         rows.append(
             {
                 "set_id": float(set_id),
-                "set_size": float(mask.sum().item()),
+                "set_size": float(source.shape[3]),
                 "variance": float(variance.cpu()),
                 "effective_rank": float(effective_rank(centered).cpu()),
                 "incremental_mean_norm": float(values.float().norm(dim=-1).mean().cpu()),
@@ -99,14 +98,14 @@ class MetricSuite(nn.Module):
         prediction: Tensor,
         target: Tensor,
         *,
-        prefix_len: int,
+        endpoint: int,
     ) -> dict[str, float]:
         metrics = {
             "psnr": float(psnr(prediction, target).mean().cpu()),
             "ssim": float(ssim(prediction, target).cpu()),
             "lpips": float(self.lpips(prediction, target).cpu()),
             "temporal_l1": float(temporal_l1(prediction, target).cpu()),
-            "frequency_leakage": float(frequency_leakage(prediction, prefix_len).cpu()),
+            "frequency_leakage": float(frequency_leakage(prediction, endpoint).cpu()),
         }
         if prediction.shape[2] > 1:
             metrics["temporal_lpips"] = float(

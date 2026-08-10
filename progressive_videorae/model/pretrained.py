@@ -44,6 +44,8 @@ class PretrainedLoadReport:
         return (
             bool(self.loaded_keys)
             and self.coverage >= self.minimum_coverage
+            and not self.shape_mismatches
+            and not self.missing_required_groups
         )
 
     def to_dict(self) -> dict:
@@ -63,6 +65,10 @@ class PretrainedLoadReport:
                 f"coverage {self.coverage:.4f} is below {self.minimum_coverage:.4f} "
                 f"({self.loaded_numel}/{self.expected_numel} numel)"
             )
+        if self.shape_mismatches:
+            problems.append(f"{len(self.shape_mismatches)} non-whitelisted shape mismatches")
+        if self.missing_required_groups:
+            problems.append(f"missing required groups {self.missing_required_groups}")
         raise RuntimeError(
             f"Pretrained validation failed for {self.component} from "
             f"{self.checkpoint_path}: " + "; ".join(problems)

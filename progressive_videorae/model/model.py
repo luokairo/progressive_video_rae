@@ -2,12 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
 from .encoders.base import VideoFoundationEncoder
 from .projector import CausalFrequencyProjector
-from .types import PrefixEncoderOutput, ProgressiveState, assert_video_tensor
+from .types import (
+    PrefixEncoderOutput,
+    ProgressiveState,
+    RepaReference,
+    SpatialPrefixView,
+    assert_video_tensor,
+    ProjectorOutput,
+)
 from .wan_decoder import CacheMode, WanCacheState, WanDecoderOutput, WanVideoDecoder
 
 
@@ -15,11 +23,33 @@ from .wan_decoder import CacheMode, WanCacheState, WanDecoderOutput, WanVideoDec
 class ProgressiveVideoRAEOutput:
     reconstruction: Tensor
     target: Tensor
-    state: ProgressiveState
+    state: ProgressiveState | None
+    state_view: ProgressiveState | SpatialPrefixView
     encoder_output: PrefixEncoderOutput
     decoder_output: WanDecoderOutput
-    repa_features: Tensor | None = None
-    repa_reference: Tensor | None = None
+    repa_features: RepaReference | None = None
+    repa_reference: RepaReference | None = None
+
+
+class PhaseSpecificRepaProjection(nn.Module):
+    def __init__(self, decoder_dim: int, encoder_dim: int) -> None:
+        super().__init__()
+        self.anchor = nn.Conv2d(decoder_dim, encoder_dim, 1)
+        self.video_phases = nn.Conv2d(decoder_dim, encoder_dim * 2, 1)
+
+    def forward(self, features: Tensor) -> RepaReference:
+        if features.ndim != 5 or features.shape[2] < 1:
+            raise ValueError("REPA features must be [B,C,T>=1,H,W]")
+        anchor = self.anchor(features[:, :, 0]).permute(0, 2, 3, 1).unsqueeze(1)
+        tail = features[:, :, 1:]
+        b, c, groups, h, w = tail.shape
+        if groups:
+            flat = tail.permute(0, 2, 1, 3, 4).reshape(b * groups, c, h, w)
+            phases = self.video_phases(flat)
+            phases = phases.reshape(b, groups, 2, -1, h, w).permute(0, 1, 2, 4, 5, 3)
+        else:
+            phases = anchor.new_empty(b, 0, 2, h, w, anchor.shape[-1])
+        return RepaReference(anchor=anchor, video_phases=phases)
 
 
 class ProgressiveVideoRAE(nn.Module):
@@ -35,8 +65,31 @@ class ProgressiveVideoRAE(nn.Module):
         self.encoder = encoder
         self.projector = projector
         self.decoder = decoder
-        self.repa_projection = nn.Conv3d(decoder_feature_dim, encoder_dim, kernel_size=1)
+        self.repa_projection = PhaseSpecificRepaProjection(decoder_feature_dim, encoder_dim)
         self.projector.contract.assert_compatible(self.decoder.contract)
+        self._runtime_timing_enabled = False
+        self._runtime_timing_events: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+
+    def enable_runtime_timing(self, enabled: bool) -> None:
+        self._runtime_timing_enabled = bool(enabled)
+        self._runtime_timing_events.clear()
+
+    def _timed(self, name: str, function):
+        if not self._runtime_timing_enabled or not torch.cuda.is_available():
+            return function()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        result = function()
+        end.record()
+        self._runtime_timing_events.setdefault(name, []).append((start, end))
+        return result
+
+    def runtime_timings(self) -> dict[str, float]:
+        return {
+            name: sum(start.elapsed_time(end) for start, end in pairs) / 1000.0
+            for name, pairs in self._runtime_timing_events.items()
+        }
 
     @property
     def state_contract(self):
@@ -73,9 +126,7 @@ class ProgressiveVideoRAE(nn.Module):
         encoder_report.assert_ready()
         decoder_report.assert_ready()
 
-    def encode(
-        self, pixel_values: Tensor, prefix_len: int = 64
-    ) -> tuple[PrefixEncoderOutput, ProgressiveState]:
+    def encode_features(self, pixel_values: Tensor) -> PrefixEncoderOutput:
         frames = int(pixel_values.shape[2]) if pixel_values.ndim == 5 else -1
         if frames < 1 or (frames - 1) % 4:
             raise ValueError("ProgressiveVideoRAE requires F=1+4*n RGB frames")
@@ -83,50 +134,175 @@ class ProgressiveVideoRAE(nn.Module):
         encode_prefixes = getattr(self.encoder, "encode_prefixes", None)
         if encode_prefixes is None:
             raise TypeError("Encoder does not implement native causal prefix extraction")
-        encoder_output = encode_prefixes(pixel_values)
-        state = self.projector(encoder_output, prefix_len=prefix_len)
-        return encoder_output, state
+        return encode_prefixes(pixel_values)
+
+    def encode(self, pixel_values: Tensor):
+        encoder_output = self.encode_features(pixel_values)
+        projected = self.projector(encoder_output)
+        return encoder_output, projected
 
     def forward(
         self,
         pixel_values: Tensor,
         *,
-        prefix_len: int = 64,
+        endpoint: int | None = None,
+        paired_previous_endpoint: int | None = None,
         cache_mode: CacheMode = "disabled",
         cache_state: WanCacheState | None = None,
         return_decoder_features: bool = False,
-    ) -> ProgressiveVideoRAEOutput:
-        encoder_output, state = self.encode(pixel_values, prefix_len=prefix_len)
-        decoder_output = self.decoder.decode(
-            state,
-            prefix_len=prefix_len,
+        sequence_id: str | None = None,
+    ) -> ProgressiveVideoRAEOutput | tuple[ProgressiveVideoRAEOutput, ProgressiveVideoRAEOutput]:
+        encoder_output = self.encode_features(pixel_values)
+        if paired_previous_endpoint is not None:
+            if endpoint is None or paired_previous_endpoint != endpoint - 1:
+                raise ValueError("paired prefix endpoints must be adjacent")
+            if cache_mode != "disabled":
+                raise ValueError("paired prefix decode requires ephemeral caches")
+            projected = self._timed("projector", lambda: self.projector(encoder_output))
+            current_view = (
+                projected.state
+                if endpoint == projected.state.full_endpoint
+                else self.projector.make_prefix_view(projected.state, endpoint)
+            )
+            previous_view = self.projector.make_prefix_view(
+                projected.state, paired_previous_endpoint
+            )
+            return self._decode_pair(
+                pixel_values,
+                encoder_output,
+                previous_view,
+                current_view,
+                sequence_id=sequence_id,
+            )
+        projected = self._timed("projector", lambda: self.projector(encoder_output))
+        return self._decode_projected(
+            pixel_values,
+            encoder_output,
+            projected,
+            endpoint=endpoint,
             cache_mode=cache_mode,
             cache_state=cache_state,
-            return_features=return_decoder_features,
+            return_decoder_features=return_decoder_features,
+            sequence_id=sequence_id,
         )
-        repa_features = None
-        repa_reference = None
+
+    def _decode_pair(
+        self,
+        pixel_values: Tensor,
+        encoder_output: PrefixEncoderOutput,
+        previous_view: SpatialPrefixView,
+        current_view: ProgressiveState | SpatialPrefixView,
+        *,
+        sequence_id: str | None,
+    ) -> tuple[ProgressiveVideoRAEOutput, ProgressiveVideoRAEOutput]:
+        previous = self._decode_state_view(
+            pixel_values,
+            encoder_output,
+            previous_view,
+            canonical_state=None,
+            cache_mode="disabled",
+            cache_state=None,
+            return_decoder_features=False,
+            sequence_id=sequence_id,
+        )
+        current = self._decode_state_view(
+                pixel_values,
+                encoder_output,
+                current_view,
+                canonical_state=(
+                    current_view if isinstance(current_view, ProgressiveState) else None
+                ),
+                cache_mode="disabled",
+                cache_state=None,
+                return_decoder_features=False,
+                sequence_id=sequence_id,
+            )
+        return previous, current
+
+    def _decode_projected(
+        self,
+        pixel_values: Tensor,
+        encoder_output: PrefixEncoderOutput,
+        projected: ProjectorOutput,
+        *,
+        endpoint: int | None,
+        cache_mode: CacheMode,
+        cache_state: WanCacheState | None,
+        return_decoder_features: bool,
+        sequence_id: str | None,
+    ) -> ProgressiveVideoRAEOutput:
+        state = projected.state
+        state_view: ProgressiveState | SpatialPrefixView = (
+            state if endpoint is None else self.projector.make_prefix_view(state, endpoint)
+        )
+        return self._decode_state_view(
+            pixel_values,
+            encoder_output,
+            state_view,
+            canonical_state=state,
+            cache_mode=cache_mode,
+            cache_state=cache_state,
+            return_decoder_features=return_decoder_features,
+            sequence_id=sequence_id,
+            repa_reference=projected.repa_reference,
+        )
+
+    def _decode_state_view(
+        self,
+        pixel_values: Tensor,
+        encoder_output: PrefixEncoderOutput,
+        state_view: ProgressiveState | SpatialPrefixView,
+        *,
+        canonical_state: ProgressiveState | None,
+        cache_mode: CacheMode,
+        cache_state: WanCacheState | None,
+        return_decoder_features: bool,
+        sequence_id: str | None,
+        repa_reference: RepaReference | None = None,
+    ) -> ProgressiveVideoRAEOutput:
+        decoder_output = self._timed(
+            "wan_forward",
+            lambda: self.decoder.decode(
+                state_view,
+                cache_mode=cache_mode,
+                cache_state=cache_state,
+                sequence_id=sequence_id,
+                return_features=return_decoder_features,
+            ),
+        )
+        repa_features: RepaReference | None = None
         if return_decoder_features:
             if decoder_output.intermediate_features is None:
                 raise RuntimeError("Decoder did not return the requested REPA feature map")
-            features = decoder_output.intermediate_features
-            if (features.shape[2] - 1) % 4:
-                raise RuntimeError("Decoder REPA time length must satisfy 1+4*n")
-            grouped = [features[:, :, :1]]
-            if features.shape[2] > 1:
-                tail = features[:, :, 1:]
-                b, c, tail_t, h, w = tail.shape
-                tail = tail.reshape(b, c, tail_t // 4, 4, h, w).mean(dim=3)
-                grouped.append(tail)
-            temporal = torch.cat(grouped, dim=2)
-            pooled = F.avg_pool3d(temporal, kernel_size=(1, 2, 2))
-            repa_features = self.repa_projection(pooled).permute(0, 2, 3, 4, 1)
-            assert state.metadata is not None
-            repa_reference = state.metadata["repa_targets"]
+            repa_features = self.repa_projection(decoder_output.intermediate_features)
+            if repa_reference is None:
+                raise RuntimeError("Full-state decode requires a REPA reference")
+        return self._make_output(
+            pixel_values,
+            encoder_output,
+            state_view,
+            canonical_state,
+            decoder_output,
+            repa_features=repa_features,
+            repa_reference=repa_reference,
+        )
+
+    @staticmethod
+    def _make_output(
+        pixel_values: Tensor,
+        encoder_output: PrefixEncoderOutput,
+        state_view: ProgressiveState | SpatialPrefixView,
+        canonical_state: ProgressiveState | None,
+        decoder_output: WanDecoderOutput,
+        *,
+        repa_features: RepaReference | None = None,
+        repa_reference: RepaReference | None = None,
+    ) -> ProgressiveVideoRAEOutput:
         return ProgressiveVideoRAEOutput(
             reconstruction=decoder_output.video,
             target=pixel_values.mul(2.0).sub(1.0),
-            state=state,
+            state=canonical_state,
+            state_view=state_view,
             encoder_output=encoder_output,
             decoder_output=decoder_output,
             repa_features=repa_features,

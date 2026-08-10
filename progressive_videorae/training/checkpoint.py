@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import random
 from typing import Any
 
@@ -45,6 +46,23 @@ def checkpoint_model_state(model: nn.Module) -> tuple[dict[str, torch.Tensor], l
         if not any(key.startswith(prefix) for prefix in excluded_prefixes)
     }
     return filtered, excluded_prefixes
+
+
+def representation_identity(model: nn.Module) -> dict[str, Any]:
+    module = unwrap(model)
+    if not hasattr(module, "projector") or not hasattr(module, "decoder"):
+        return {}
+    encoder = getattr(module, "encoder", None)
+    encoder_report = getattr(encoder, "load_report", None)
+    return {
+        "encoder_checkpoint": getattr(encoder_report, "checkpoint_path", None),
+        "encoder_variant": getattr(encoder, "variant", None),
+        "selected_vjepa_layers": list(getattr(encoder, "output_layers", ())),
+        "layout_checksum": module.projector.layout_checksum,
+        "layout_version": module.projector.layout_version,
+        "codec_id": module.decoder.codec_id,
+        "decoder_id": module.decoder.decoder_id,
+    }
 
 
 def load_model_state(model: nn.Module, state: dict[str, torch.Tensor]) -> None:
@@ -96,10 +114,14 @@ def save_checkpoint(
     epoch: int,
     config: dict[str, Any],
     log_file: str | None = None,
+    stage: str | None = None,
+    objective_mode: str | None = None,
+    update_latest: bool = False,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     model_state, excluded_model_prefixes = checkpoint_model_state(model)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     torch.save(
         {
             "model": model_state,
@@ -110,12 +132,16 @@ def save_checkpoint(
                 else None
             ),
             "state_contract": unwrap(model).state_contract.to_dict(),
+            "representation_identity": representation_identity(model),
             "discriminator": unwrap(discriminator).state_dict(),
             "generator_optimizer": generator_optimizer.state_dict(),
             "discriminator_optimizer": discriminator_optimizer.state_dict(),
             "generator_scheduler": generator_scheduler.state_dict(),
             "discriminator_scheduler": discriminator_scheduler.state_dict(),
             "optimizer_step": optimizer_step,
+            "checkpoint_schema_version": 3,
+            "stage": stage,
+            "objective_mode": objective_mode,
             "discriminator_update_count": discriminator_update_count,
             "epoch": epoch,
             "log_file": log_file,
@@ -123,13 +149,18 @@ def save_checkpoint(
             "config": config,
             "upstream_commits": {
                 "vjepa2": "204698b45b3712590f06245fbfba32d3be539812",
-                "videomaev2": "29eab1e8a588d1b3ec0cdec7b03a86cca491b74b",
-                "nova": "63c5a724fc4e264e229a95c893184434f00c9413",
                 "wan2.2": "42bf4cfaa384bc21833865abc2f9e6c0e67233dc",
             },
         },
-        path,
+        temporary_path,
     )
+    os.replace(temporary_path, path)
+    if update_latest:
+        latest = path.parent / "latest.pt"
+        temporary_latest = path.parent / f".latest.{os.getpid()}.tmp"
+        temporary_latest.unlink(missing_ok=True)
+        temporary_latest.symlink_to(path.name)
+        os.replace(temporary_latest, latest)
 
 
 def load_checkpoint(
@@ -149,6 +180,9 @@ def load_checkpoint(
         raise RuntimeError(
             f"Training checkpoint {path} has a missing or incompatible StateContract"
         )
+    saved_identity = checkpoint.get("representation_identity")
+    if saved_identity is not None and saved_identity != representation_identity(model):
+        raise RuntimeError(f"Training checkpoint {path} representation identity mismatch")
     saved_pretrained_report = checkpoint.get("pretrained_load_report")
     if saved_pretrained_report is not None and (
         not isinstance(saved_pretrained_report, dict)

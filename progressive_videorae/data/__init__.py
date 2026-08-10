@@ -1,13 +1,12 @@
 from .dataset import VideoManifestDataset, collate_video_samples
 from .manifest import ManifestBuildResult, build_manifest, parse_csv_spec
-from .sampler import BalancedHumanNonSpeechSampler
+from .sampler import DistributedFullDatasetSampler
 
 __all__ = [
-    "BalancedHumanNonSpeechSampler",
+    "DistributedFullDatasetSampler",
     "ManifestBuildResult",
     "VideoManifestDataset",
     "build_manifest",
     "collate_video_samples",
     "parse_csv_spec",
 ]
-

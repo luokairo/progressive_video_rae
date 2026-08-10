@@ -34,7 +34,7 @@ def average_numeric(rows: list[dict[str, Any]]) -> dict[str, float]:
     return {
         key: float(np.mean([row[key] for row in rows if key in row]))
         for key in keys
-        if key != "prefix_len"
+        if key != "endpoint"
     }
 
 
@@ -101,7 +101,7 @@ def main() -> None:
     fake_fvd: list[np.ndarray] = []
     saved_videos = 0
     cache_error = None
-    prefixes = [int(value) for value in evaluation["prefixes"]]
+    endpoints = [int(value) for value in evaluation["endpoints"]]
     precision = torch.bfloat16 if evaluation["precision"] == "bf16" else torch.float16
 
     for clip_index, batch in enumerate(loader):
@@ -121,30 +121,34 @@ def main() -> None:
             torch.cuda.synchronize()
         encoder_seconds = time.perf_counter() - encoder_started
 
-        for prefix_len in prefixes:
+        with torch.inference_mode(), torch.autocast(
+            device.type, dtype=precision, enabled=device.type == "cuda"
+        ):
+            projected = model.projector(encoder_output)
+        for endpoint in endpoints:
             with torch.inference_mode(), torch.autocast(
                 device.type, dtype=precision, enabled=device.type == "cuda"
             ):
-                state = model.projector(encoder_output, prefix_len=prefix_len)
+                state = projected.state
+                state_view = state if endpoint == 47 else model.projector.make_prefix_view(state, endpoint)
                 decoder_started = time.perf_counter()
-                decoder_output = model.decoder.decode(
-                    state, prefix_len=prefix_len, cache_mode="disabled"
-                )
+                decoder_output = model.decoder.decode(state_view, cache_mode="disabled")
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 decoder_seconds = time.perf_counter() - decoder_started
             with torch.autocast(device.type, enabled=False):
-                dct_target = dct_lowpass_target(target_rgb.float(), prefix_len)
+                dct_target = dct_lowpass_target(target_rgb.float(), endpoint)
             prediction = decoder_output.video.float()
             prefix_metrics = metric_suite.reconstruction(
-                prediction, dct_target.float(), prefix_len=prefix_len
+                prediction, dct_target.float(), endpoint=endpoint
             )
             row = {
                 "sample_id": batch["sample_id"][0],
                 "path": batch["path"][0],
                 "category": batch["category"][0],
                 "source_tags": "+".join(batch["source_tags"][0]),
-                "prefix_len": prefix_len,
+                "endpoint": endpoint,
+                "visible_set_count": endpoint + 1,
                 "psnr_rgb": float(psnr(prediction, target_rgb.float()).mean().cpu()),
                 "encoder_seconds": encoder_seconds,
                 "decoder_seconds": decoder_seconds,
@@ -154,7 +158,7 @@ def main() -> None:
                 **prefix_metrics,
             }
             rows.append(row)
-            if prefix_len == 64:
+            if endpoint == 47:
                 with torch.inference_mode(), torch.autocast(
                     device.type, dtype=precision, enabled=device.type == "cuda"
                 ):
@@ -173,25 +177,25 @@ def main() -> None:
                     with torch.autocast(
                         device.type, dtype=precision, enabled=device.type == "cuda"
                     ):
-                        cached = model.decoder.decode(state, prefix_len=64, cache_mode="reset")
+                        cached = model.decoder.decode(state, cache_mode="reset")
                     cache_error = float((cached.video.float() - prediction).abs().max().cpu())
 
             if (
                 evaluation.get("save_videos", False)
                 and saved_videos < evaluation.get("save_video_limit", 8)
-                and prefix_len in (1, 8, 32, 64)
+                and endpoint in (0, 7, 31, 47)
             ):
                 save_comparison_video(
-                    output_dir / "videos" / f"{batch['sample_id'][0]}_p{prefix_len:02d}.mp4",
+                    output_dir / "videos" / f"{batch['sample_id'][0]}_p{endpoint:02d}.mp4",
                     [target_rgb[0], dct_target[0], decoder_output.video[0]],
                     fps=data_config["target_fps"],
                 )
-                if prefix_len == 64:
+                if endpoint == 47:
                     saved_videos += 1
 
     grouped = {
-        str(prefix): average_numeric([row for row in rows if row["prefix_len"] == prefix])
-        for prefix in prefixes
+        str(endpoint): average_numeric([row for row in rows if row["endpoint"] == endpoint])
+        for endpoint in endpoints
     }
     category_groups = {
         category: average_numeric([row for row in rows if row["category"] == category])
@@ -205,7 +209,7 @@ def main() -> None:
     for sample_id in {row["sample_id"] for row in rows}:
         sample_rows = sorted(
             (row for row in rows if row["sample_id"] == sample_id),
-            key=lambda row: row["prefix_len"],
+            key=lambda row: row["endpoint"],
         )
         comparisons = [
             later["psnr_rgb"] >= earlier["psnr_rgb"]

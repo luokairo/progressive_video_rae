@@ -24,8 +24,9 @@ state:
   height: 30
   width: 48
   channels: 48
-  num_sets: 64
-  layout_version: fps_v1_h30_w48_s64
+  num_sets: 48
+  tokens_per_set: 30
+  layout_version: fps_v2_h30_w48_s48_k30
 
 projector:
   hidden_dim: 512
@@ -43,5 +44,5 @@ decoder:
   latent_channels: 48
   base_dim: 256
   spatial_upsample: 16
-  temporal_mode: rae_group_expand
-  feature_cache: false
+  temporal_mode: native_wan_r4
+  feature_cache: true

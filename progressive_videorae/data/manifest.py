@@ -83,32 +83,30 @@ def _select_caption(current: str, candidate: Any) -> str:
 
 
 def merge_source_rows(source_rows: Iterable[tuple[CsvSource, Iterable[dict[str, Any]]]]) -> list[dict[str, Any]]:
-    human: dict[str, dict[str, Any]] = {}
-    non_speech: dict[str, dict[str, Any]] = {}
+    merged_by_path: dict[str, dict[str, Any]] = {}
     for source, rows in source_rows:
-        target = human if source.category == "human" else non_speech
         for row in rows:
             raw_path = row.get("path")
             if raw_path is None or str(raw_path).strip().lower() in {"", "nan", "none"}:
                 continue
             path = normalize_video_path(str(raw_path))
-            record = target.setdefault(
+            record = merged_by_path.setdefault(
                 path,
                 {
                     "path": path,
                     "caption": "",
-                    "category": source.category,
+                    "categories": set(),
                     "source_tags": set(),
                 },
             )
             record["caption"] = _select_caption(record["caption"], row.get("caption", ""))
+            record["categories"].add(source.category)
             record["source_tags"].add(source.source_tag)
 
-    for path in human.keys() & non_speech.keys():
-        non_speech.pop(path)
-
     merged = []
-    for record in [*human.values(), *non_speech.values()]:
+    for record in merged_by_path.values():
+        categories = sorted(record.pop("categories"))
+        record["category"] = categories[0] if len(categories) == 1 else "mixed"
         record["source_tags"] = sorted(record["source_tags"])
         record["sample_id"] = stable_sample_id(record["path"])
         merged.append(record)

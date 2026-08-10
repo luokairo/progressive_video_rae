@@ -138,7 +138,7 @@ def test_vjepa_vitg_uses_giant_builder_and_target_encoder_checkpoint(
     assert encoder.variant == "vitg"
     assert encoder.depth == 40
     assert encoder.embed_dim == 1408
-    assert encoder.layer_norms[0].normalized_shape == (1408,)
+    assert not hasattr(encoder, "layer_norms")
     assert encoder.load_report.ready
 
 
@@ -160,7 +160,7 @@ def test_vjepa_rejects_unknown_variant_and_out_of_range_layers(
     [
         (
             "vitl",
-            "/share/project/liujingyi/ckpts/vjepa2/vitl/original/model.pth",
+            "/share/project/liujingyi/ckpts/vjepa2/original/model.pth",
             (8, 12, 16, 20, 24),
         ),
         (
@@ -232,23 +232,20 @@ def test_wan_decoder_requires_complete_pretrained_decoder(tmp_path: Path):
         pytest.skip("Pinned local Wan2.2 source is unavailable")
 
     uninitialized = WanVideoDecoder(
-        source_root=str(source_root), base_dim=8, output_size=(32, 48), load_pretrained=False
+        source_root=str(source_root), base_dim=8, output_size=(480, 768), load_pretrained=False
     )
     state = {
         **{f"decoder.{key}": value.detach().clone() for key, value in uninitialized.decoder.state_dict().items()},
         **{f"conv2.{key}": value.detach().clone() for key, value in uninitialized.pre_decoder.state_dict().items()},
-        "decoder.upsamples.0.upsamples.3.time_conv.weight": torch.zeros(1),
     }
     checkpoint_path = tmp_path / "wan.pt"
     torch.save(state, checkpoint_path)
     loaded = WanVideoDecoder(
-        str(checkpoint_path), source_root=str(source_root), base_dim=8, output_size=(32, 48)
+        str(checkpoint_path), source_root=str(source_root), base_dim=8, output_size=(480, 768)
     )
     assert loaded.load_report.ready
     assert loaded.load_report.decoder.coverage == 1.0
-    assert "upsamples.0.upsamples.3.time_conv.weight" in (
-        loaded.load_report.decoder.ignored_checkpoint_keys
-    )
+    assert any("time_conv" in key for key in loaded.load_report.decoder.loaded_keys)
 
     broken = {key: value for key, value in state.items() if key.startswith("conv2.") or key == "decoder.conv1.weight"}
     torch.save(broken, tmp_path / "wan_broken.pt")
@@ -257,5 +254,5 @@ def test_wan_decoder_requires_complete_pretrained_decoder(tmp_path: Path):
             str(tmp_path / "wan_broken.pt"),
             source_root=str(source_root),
             base_dim=8,
-            output_size=(32, 48),
+            output_size=(480, 768),
         )

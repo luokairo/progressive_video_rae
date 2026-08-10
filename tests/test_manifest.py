@@ -23,7 +23,7 @@ def test_csv_spec_preserves_three_source_meanings(tmp_path: Path):
     ]
 
 
-def test_environment_music_overlap_merges_tags_and_human_wins(tmp_path: Path):
+def test_all_sources_are_deduplicated_without_sampling_priority(tmp_path: Path):
     human = CsvSource(tmp_path / "h.csv", "human", "human", "")
     environment = CsvSource(tmp_path / "e.csv", "non_speech", "environment", "")
     music = CsvSource(tmp_path / "m.csv", "non_speech", "music", "")
@@ -43,11 +43,11 @@ def test_environment_music_overlap_merges_tags_and_human_wins(tmp_path: Path):
     by_path = {row["path"]: row for row in rows}
     assert by_path["/v/shared.mp4"]["source_tags"] == ["environment", "music"]
     assert by_path["/v/shared.mp4"]["caption"] == "a longer caption"
-    assert by_path["/v/h.mp4"]["category"] == "human"
+    assert by_path["/v/h.mp4"]["category"] == "mixed"
+    assert by_path["/v/h.mp4"]["source_tags"] == ["environment", "human"]
 
 
 def test_hash_split_is_deterministic():
     first = assign_split("/video/a.mp4", 20260807, (0.95, 0.025, 0.025))
     second = assign_split("/video/a.mp4", 20260807, (0.95, 0.025, 0.025))
     assert first == second
-

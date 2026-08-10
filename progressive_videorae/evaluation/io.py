@@ -44,15 +44,14 @@ def save_prefix_curve(rows: list[dict], output_path: str | Path, metric: str = "
     grouped: dict[int, list[float]] = {}
     for row in rows:
         if metric in row:
-            grouped.setdefault(int(row["prefix_len"]), []).append(float(row[metric]))
-    prefixes = sorted(grouped)
-    values = [sum(grouped[prefix]) / len(grouped[prefix]) for prefix in prefixes]
+            grouped.setdefault(int(row["endpoint"]), []).append(float(row[metric]))
+    endpoints = sorted(grouped)
+    values = [sum(grouped[endpoint]) / len(grouped[endpoint]) for endpoint in endpoints]
     figure, axis = plt.subplots(figsize=(7, 4))
-    axis.plot(prefixes, values, marker="o")
-    axis.set_xlabel("Prefix length")
+    axis.plot(endpoints, values, marker="o")
+    axis.set_xlabel("Inclusive set endpoint")
     axis.set_ylabel(metric)
     axis.grid(True, alpha=0.3)
     figure.tight_layout()
     figure.savefig(output_path, dpi=160)
     plt.close(figure)
-

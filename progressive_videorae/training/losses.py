@@ -5,8 +5,10 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 from ..model.model import ProgressiveVideoRAEOutput
+from ..model.dct import dct_band_coefficients, frequency_leakage
 
 
 class PatchDiscriminator(nn.Module):
@@ -57,7 +59,14 @@ class FrozenLPIPS(nn.Module):
         real = target.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
         values = []
         for start in range(0, pred.shape[0], chunk_size):
-            values.append(self.model(pred[start : start + chunk_size], real[start : start + chunk_size]))
+            pred_chunk = pred[start : start + chunk_size]
+            real_chunk = real[start : start + chunk_size]
+            if self.training and pred_chunk.requires_grad:
+                values.append(
+                    checkpoint(self.model, pred_chunk, real_chunk, use_reentrant=False)
+                )
+            else:
+                values.append(self.model(pred_chunk, real_chunk))
         return torch.cat(values).mean()
 
 
@@ -97,6 +106,9 @@ class ProgressiveLosses(nn.Module):
         repa_global_weight: float = 1.0,
         adversarial_weight: float = 0.1,
         temporal_l1_weight: float = 0.0,
+        band_weight: float = 1.0,
+        leakage_weight: float = 0.1,
+        paired_delta_weight: float = 1.0,
     ) -> None:
         super().__init__()
         self.lpips = FrozenLPIPS()
@@ -107,16 +119,56 @@ class ProgressiveLosses(nn.Module):
         self.repa_global_weight = float(repa_global_weight)
         self.adversarial_weight = float(adversarial_weight)
         self.temporal_l1_weight = float(temporal_l1_weight)
+        self.band_weight = float(band_weight)
+        self.leakage_weight = float(leakage_weight)
+        self.paired_delta_weight = float(paired_delta_weight)
 
-    def prefix(self, output: ProgressiveVideoRAEOutput, target: Tensor) -> LossOutput:
+    def _lpips(self, prediction: Tensor, target: Tensor) -> Tensor:
+        return self.lpips(prediction, target)
+
+    def prefix(
+        self,
+        output: ProgressiveVideoRAEOutput,
+        target: Tensor,
+        *,
+        endpoint: int,
+        full_target: Tensor,
+        previous_prediction: Tensor | None = None,
+    ) -> LossOutput:
         l1 = F.l1_loss(output.reconstruction, target)
-        perceptual = self.lpips(output.reconstruction, target)
+        perceptual = self._lpips(output.reconstruction, target)
         temporal = temporal_l1(output.reconstruction, target)
-        terms = {"l1": l1, "lpips": perceptual, "temporal_l1": temporal}
+        target_coeff, band_mask = dct_band_coefficients(full_target.float(), endpoint)
+        prediction_coeff, _ = dct_band_coefficients(
+            output.reconstruction.float(), endpoint
+        )
+        if bool(band_mask.any()):
+            band = F.l1_loss(prediction_coeff[band_mask], target_coeff[band_mask])
+        else:
+            band = output.reconstruction.sum() * 0.0
+        leakage = frequency_leakage(output.reconstruction.float(), endpoint)
+        paired_delta = output.reconstruction.new_zeros(())
+        if previous_prediction is not None:
+            delta_coeff, _ = dct_band_coefficients(
+                (output.reconstruction - previous_prediction).float(), endpoint
+            )
+            if bool(band_mask.any()):
+                paired_delta = F.l1_loss(delta_coeff[band_mask], target_coeff[band_mask])
+        terms = {
+            "l1": l1,
+            "lpips": perceptual,
+            "temporal_l1": temporal,
+            "band": band,
+            "leakage": leakage,
+            "paired_delta": paired_delta,
+        }
         weighted_terms = {
             "l1": self.l1_weight * l1,
             "lpips": self.prefix_lpips_weight * perceptual,
             "temporal_l1": self.temporal_l1_weight * temporal,
+            "band": self.band_weight * band,
+            "leakage": self.leakage_weight * leakage,
+            "paired_delta": self.paired_delta_weight * paired_delta,
         }
         total = sum(weighted_terms.values())
         return LossOutput(total=total, terms=terms, weighted_terms=weighted_terms)
@@ -129,19 +181,38 @@ class ProgressiveLosses(nn.Module):
         adversarial_factor: float = 1.0,
     ) -> LossOutput:
         l1 = F.l1_loss(output.reconstruction, output.target)
-        perceptual = self.lpips(output.reconstruction, output.target)
+        perceptual = self._lpips(output.reconstruction, output.target)
         if output.repa_features is None:
             raise RuntimeError("Full-state training requires decoder REPA features")
         if output.repa_reference is None:
             raise RuntimeError("Full-state training requires group-aligned REPA targets")
-        reference = output.repa_reference.detach()
-        if output.repa_features.shape != reference.shape:
-            raise RuntimeError(
-                f"REPA shape mismatch: {tuple(output.repa_features.shape)} vs {tuple(reference.shape)}"
+        predicted = output.repa_features
+        reference = output.repa_reference
+        if predicted.anchor.shape != reference.anchor.shape:
+            raise RuntimeError("REPA anchor shape mismatch")
+        if predicted.video_phases.shape != reference.video_phases.shape:
+            raise RuntimeError("REPA video phase shape mismatch")
+        anchor_local = 1.0 - F.cosine_similarity(
+            predicted.anchor, reference.anchor.detach(), dim=-1
+        ).mean()
+        if predicted.video_phases.numel():
+            video_local = 1.0 - F.cosine_similarity(
+                predicted.video_phases, reference.video_phases.detach(), dim=-1
+            ).mean()
+            local = 0.5 * (anchor_local + video_local)
+            predicted_all = torch.cat(
+                (predicted.anchor.flatten(1, 3), predicted.video_phases.flatten(1, 4)), dim=1
             )
-        local = 1.0 - F.cosine_similarity(output.repa_features, reference, dim=-1).mean()
-        predicted_global = output.repa_features.mean(dim=(1, 2, 3))
-        reference_global = reference.mean(dim=(1, 2, 3))
+            reference_all = torch.cat(
+                (reference.anchor.flatten(1, 3), reference.video_phases.flatten(1, 4)), dim=1
+            ).detach()
+        else:
+            video_local = anchor_local.new_zeros(())
+            local = anchor_local
+            predicted_all = predicted.anchor.flatten(1, 3)
+            reference_all = reference.anchor.flatten(1, 3).detach()
+        predicted_global = predicted_all.mean(dim=1)
+        reference_global = reference_all.mean(dim=1)
         global_loss = 1.0 - F.cosine_similarity(
             predicted_global, reference_global, dim=-1
         ).mean()
@@ -156,6 +227,8 @@ class ProgressiveLosses(nn.Module):
             "lpips": perceptual,
             "temporal_l1": temporal,
             "repa_local": local,
+            "repa_anchor": anchor_local,
+            "repa_video": video_local,
             "repa_global": global_loss,
             "adversarial": adversarial,
         }

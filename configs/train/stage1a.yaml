@@ -1,37 +1,37 @@
 model_config: configs/model/full_480p.yaml
-data_config: configs/data/default.yaml
-
+data_config: configs/data/default_17f.yaml
 stage: stage1a
+objective_mode: full_repa
 max_steps: 10000
 global_batch_size: 64
 micro_batch_size: 1
 gradient_accumulation_steps: 8
 precision: bf16
+gradient_checkpointing: true
+gradient_checkpointing_by_phase:
+  warmup: true
+  interface: true
+  full: true
+fused_optimizer: true
+verify_ddp_gradient_sync: false
 projector_lr: 1.0e-4
-decoder_lr: 5.0e-5
+wan_temporal_lr: 2.0e-5
+wan_spatial_lr: 5.0e-6
 discriminator_lr: 5.0e-5
 weight_decay: 0.05
 warmup_steps: 1000
 gradient_clip: 1.0
-cache_mode: disabled
-full_prefix_probability: 1.0
-prefix_schedule: full
-prefix_min: 1
-prefix_max: 63
-full_objective_weight: 1.0
-prefix_objective_weight: 1.0
+wan_interface_step: 2000
+wan_full_step: 5000
 l1_weight: 1.0
-prefix_lpips_weight: 0.5
 lpips_weight: 1.0
 temporal_l1_weight: 0.1
 repa_local_weight: 1.0
 repa_global_weight: 1.0
 adversarial_weight: 0.1
-discriminator_weight: 1.0
 disc_start: 5000
 adversarial_ramp_steps: 2000
-discriminator_update_interval: 1
-log_dir: /share/project/liujingyi/logs/waverae/progressive_video_rae/stage1
 output_dir: outputs/stage1a
 save_every: 1000
+save_at_steps: [100, 500]
 log_every: 10

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
 torch = pytest.importorskip("torch")
 from torch import nn
 
-from progressive_videorae.training.checkpoint import save_checkpoint
+from progressive_videorae.training.checkpoint import representation_identity, save_checkpoint
+from progressive_videorae.model.types import StateContract
 from progressive_videorae.training.logging import (
     GlobalMetricWindow,
     append_jsonl_record,
@@ -123,8 +125,31 @@ def test_only_rank_zero_appends_jsonl_record(tmp_path):
 
 
 
+def test_representation_identity_binds_encoder_layers_and_codec():
+    model = SimpleNamespace(
+        encoder=SimpleNamespace(
+            variant="vitl",
+            output_layers=(8, 12, 16, 20, 24),
+            load_report=SimpleNamespace(checkpoint_path="/weights/vjepa2.pth"),
+        ),
+        projector=SimpleNamespace(layout_checksum="checksum", layout_version="layout-v3"),
+        decoder=SimpleNamespace(codec_id="codec-v3", decoder_id="decoder-v1"),
+    )
+
+    assert representation_identity(model) == {
+        "encoder_checkpoint": "/weights/vjepa2.pth",
+        "encoder_variant": "vitl",
+        "selected_vjepa_layers": [8, 12, 16, 20, 24],
+        "layout_checksum": "checksum",
+        "layout_version": "layout-v3",
+        "codec_id": "codec-v3",
+        "decoder_id": "decoder-v1",
+    }
+
+
 def test_checkpoint_stores_log_file(tmp_path):
     model = nn.Linear(2, 2)
+    model.state_contract = StateContract()
     discriminator = nn.Linear(2, 1)
     generator_optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
     discriminator_optimizer = torch.optim.SGD(discriminator.parameters(), lr=0.1)
@@ -150,8 +175,12 @@ def test_checkpoint_stores_log_file(tmp_path):
         epoch=1,
         config={},
         log_file=log_file,
+        update_latest=True,
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     assert checkpoint["log_file"] == log_file
-
+    latest = tmp_path / "latest.pt"
+    assert latest.is_symlink()
+    assert latest.resolve() == checkpoint_path.resolve()
+    assert not tuple(tmp_path.glob(".*.tmp"))

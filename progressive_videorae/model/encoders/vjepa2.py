@@ -142,12 +142,6 @@ class VJEPA2Encoder(VideoFoundationEncoder):
             ),
         )
 
-        self.layer_norms = nn.ModuleList(
-            [
-                nn.LayerNorm(self.embed_dim, eps=1e-6, elementwise_affine=False)
-                for _ in self.output_layers
-            ]
-        )
         self.register_buffer("mean", torch.tensor(VJEPA2_MEAN).view(1, 3, 1, 1, 1), persistent=False)
         self.register_buffer("std", torch.tensor(VJEPA2_STD).view(1, 3, 1, 1, 1), persistent=False)
         self.frozen = bool(freeze)
@@ -192,15 +186,15 @@ class VJEPA2Encoder(VideoFoundationEncoder):
             outputs = self.backbone(x)
         if not isinstance(outputs, (tuple, list)) or len(outputs) != len(self.output_layers):
             raise RuntimeError("V-JEPA2 did not return the configured intermediate layers")
-        normalized = tuple(norm(tensor) for norm, tensor in zip(self.layer_norms, outputs))
-        fused = torch.stack(normalized, dim=0).sum(dim=0)
-        b, n, c = fused.shape
+        official_layers = tuple(outputs)
+        tokens = official_layers[-1]
+        b, n, c = tokens.shape
         t = frames // self.tubelet_size
         _, h, w = self.grid_size
         if n != t * h * w:
             raise RuntimeError(f"V-JEPA2 token count {n} does not match grid {self.grid_size}")
-        grid = fused.reshape(b, t, h, w, c)
-        layer_grids = tuple(tensor.reshape(b, t, h, w, c) for tensor in normalized)
+        grid = tokens.reshape(b, t, h, w, c)
+        layer_grids = tuple(tensor.reshape(b, t, h, w, c) for tensor in official_layers)
         return EncoderOutput(tokens=grid, grid_size=(t, h, w), layer_tokens=layer_grids)
 
     def encode_prefixes(self, pixel_values: Tensor) -> PrefixEncoderOutput:
