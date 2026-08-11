@@ -38,20 +38,4 @@ def save_comparison_video(
             container.mux(packet)
 
 
-def save_prefix_curve(rows: list[dict], output_path: str | Path, metric: str = "psnr_rgb") -> None:
-    import matplotlib.pyplot as plt
-
-    grouped: dict[int, list[float]] = {}
-    for row in rows:
-        if metric in row:
-            grouped.setdefault(int(row["endpoint"]), []).append(float(row[metric]))
-    endpoints = sorted(grouped)
-    values = [sum(grouped[endpoint]) / len(grouped[endpoint]) for endpoint in endpoints]
-    figure, axis = plt.subplots(figsize=(7, 4))
-    axis.plot(endpoints, values, marker="o")
-    axis.set_xlabel("Inclusive set endpoint")
-    axis.set_ylabel(metric)
-    axis.grid(True, alpha=0.3)
-    figure.tight_layout()
-    figure.savefig(output_path, dpi=160)
-    plt.close(figure)
+__all__ = ["save_comparison_video"]

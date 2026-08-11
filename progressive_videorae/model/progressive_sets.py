@@ -11,6 +11,7 @@ from torch import Tensor
 
 SET_SIZES: tuple[int, ...] = (30,) * 48
 LAYOUT_VERSION = "fps_v2_h30_w48_s48_k30"
+LAYOUT_CHECKSUM = "00c67dda3753fe5c7f800b2f20d84a1116a9acfa07fcaf5b7281910d2048c535"
 
 
 @dataclass(frozen=True)

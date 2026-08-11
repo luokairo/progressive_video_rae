@@ -32,9 +32,18 @@ def test_model_and_training_configs_resolve_from_project_root():
     assert stage1a["fused_optimizer"] is True
     assert stage1a["save_at_steps"] == [100, 500]
     stage2a = load_training_bundle("configs/train/stage2a.yaml")["training"]
-    stage2b = load_training_bundle("configs/train/stage2b.yaml")["training"]
+    stage2b_bundle = load_training_bundle("configs/train/stage2b.yaml")
+    stage2b = stage2b_bundle["training"]
     assert not any(key.startswith("prefix") for key in stage2a)
     assert not any(key.startswith("prefix") for key in stage2b)
+    checkpoint_root = "/share/project/liujingyi/ckpts/progressive_video_rae/training"
+    log_dir = "/share/project/liujingyi/logs/waverae/progressive_video_rae"
+    assert stage1a["checkpoint_root"] == checkpoint_root
+    assert stage2b["checkpoint_root"] == checkpoint_root
+    assert stage1a["log_dir"] == log_dir
+    assert stage2b["log_dir"] == log_dir
+    assert stage2b_bundle["model"]["video"]["num_frames"] == 33
+    assert stage2b_bundle["model"]["state"]["num_frames"] == 9
 
     vitg_bundle = load_training_bundle(
         "configs/train/stage1b.yaml",

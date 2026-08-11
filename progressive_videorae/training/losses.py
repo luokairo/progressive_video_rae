@@ -196,9 +196,11 @@ class ProgressiveLosses(nn.Module):
             predicted.anchor, reference.anchor.detach(), dim=-1
         ).mean()
         if predicted.video_phases.numel():
-            video_local = 1.0 - F.cosine_similarity(
+            phase_errors = 1.0 - F.cosine_similarity(
                 predicted.video_phases, reference.video_phases.detach(), dim=-1
-            ).mean()
+            )
+            video_local = phase_errors.mean()
+            group_phase_errors = phase_errors.mean(dim=(0, 3, 4))
             local = 0.5 * (anchor_local + video_local)
             predicted_all = torch.cat(
                 (predicted.anchor.flatten(1, 3), predicted.video_phases.flatten(1, 4)), dim=1
@@ -208,6 +210,7 @@ class ProgressiveLosses(nn.Module):
             ).detach()
         else:
             video_local = anchor_local.new_zeros(())
+            group_phase_errors = anchor_local.new_empty((0, 2))
             local = anchor_local
             predicted_all = predicted.anchor.flatten(1, 3)
             reference_all = reference.anchor.flatten(1, 3).detach()
@@ -240,8 +243,22 @@ class ProgressiveLosses(nn.Module):
             "repa_global": self.repa_global_weight * global_loss,
             "adversarial": self.adversarial_weight * float(adversarial_factor) * adversarial,
         }
+        statistics = {"repa/anchor_error": anchor_local}
+        for group_index in range(group_phase_errors.shape[0]):
+            statistics[f"repa/group_{group_index:02d}/f0_error"] = group_phase_errors[
+                group_index, 0
+            ]
+            statistics[f"repa/group_{group_index:02d}/f1_error"] = group_phase_errors[
+                group_index, 1
+            ]
+        if group_phase_errors.shape[0] >= 4:
+            tail_four = group_phase_errors[-4:]
+            statistics["repa/tail_four_mean"] = tail_four.mean()
+            statistics["repa/tail_four_worst"] = tail_four.max()
         total = sum(weighted_terms.values())
-        return LossOutput(total=total, terms=terms, weighted_terms=weighted_terms)
+        return LossOutput(
+            total=total, terms=terms, weighted_terms=weighted_terms, statistics=statistics
+        )
 
     @staticmethod
     def discriminator(

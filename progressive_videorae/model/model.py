@@ -298,9 +298,15 @@ class ProgressiveVideoRAE(nn.Module):
         repa_features: RepaReference | None = None,
         repa_reference: RepaReference | None = None,
     ) -> ProgressiveVideoRAEOutput:
+        target = pixel_values.mul(2.0).sub(1.0)
+        if decoder_output.video.shape != target.shape:
+            raise RuntimeError(
+                "Decoder reconstruction shape mismatch: "
+                f"got {tuple(decoder_output.video.shape)}, expected {tuple(target.shape)}"
+            )
         return ProgressiveVideoRAEOutput(
             reconstruction=decoder_output.video,
-            target=pixel_values.mul(2.0).sub(1.0),
+            target=target,
             state=canonical_state,
             state_view=state_view,
             encoder_output=encoder_output,

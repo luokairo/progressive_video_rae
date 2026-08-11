@@ -31,7 +31,8 @@ repa_global_weight: 1.0
 adversarial_weight: 0.1
 disc_start: 5000
 adversarial_ramp_steps: 2000
-output_dir: outputs/stage1a
+checkpoint_root: /share/project/liujingyi/ckpts/progressive_video_rae/training
+log_dir: /share/project/liujingyi/logs/waverae/progressive_video_rae
 save_every: 1000
 save_at_steps: [100, 500]
 log_every: 10

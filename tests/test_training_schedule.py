@@ -11,6 +11,7 @@ from progressive_videorae.training.stages import (
     sample_microbatch_tasks,
     stage1a_phase,
     validate_stage_objective,
+    validate_training_bundle,
 )
 from progressive_videorae.train import validate_resume_training_contract
 
@@ -59,8 +60,50 @@ def test_stage2_plans_are_full_only_and_keep_repa_objective(stage):
 def test_stage2_rejects_any_prefix_configuration():
     config = load_training_bundle("configs/train/stage2a.yaml")["training"]
     config["prefix_schedule"] = "full"
-    with pytest.raises(ValueError, match="forbids spatial-prefix"):
+    with pytest.raises(ValueError, match="forbids prefix/DCT/mask-replacement"):
         validate_stage_objective(config)
+
+
+@pytest.mark.parametrize(
+    ("stage", "frames", "latents"),
+    (
+        ("stage1a", 17, 5),
+        ("stage1b", 17, 5),
+        ("stage2a", 17, 5),
+        ("stage2b", 33, 9),
+    ),
+)
+def test_training_bundle_preflight_enforces_stage_geometry(stage, frames, latents):
+    bundle = load_training_bundle(f"configs/train/{stage}.yaml")
+
+    assert validate_training_bundle(
+        bundle["training"], bundle["model"], bundle["data"]
+    ) == (frames, latents)
+
+
+def test_training_bundle_preflight_runs_after_frame_override():
+    bundle = load_training_bundle("configs/train/stage2b.yaml")
+    bundle["data"]["num_frames"] = 17
+
+    with pytest.raises(ValueError, match="exactly 33 RGB frames"):
+        validate_training_bundle(bundle["training"], bundle["model"], bundle["data"])
+
+
+def test_stage2b_preflight_rejects_encoder_context_below_34():
+    bundle = load_training_bundle("configs/train/stage2b.yaml")
+    bundle["model"]["encoder"]["max_context_frames"] = 32
+
+    with pytest.raises(ValueError, match="exceeds context"):
+        validate_training_bundle(bundle["training"], bundle["model"], bundle["data"])
+
+
+@pytest.mark.parametrize("key", ["dct_weight", "mask_replacement_probability"])
+def test_stage2_rejects_dct_and_mask_replacement_configuration(key):
+    bundle = load_training_bundle("configs/train/stage2a.yaml")
+    bundle["training"][key] = 1.0
+
+    with pytest.raises(ValueError, match="forbids prefix/DCT/mask-replacement"):
+        validate_training_bundle(bundle["training"], bundle["model"], bundle["data"])
 
 
 class _DummyWanCore(nn.Module):

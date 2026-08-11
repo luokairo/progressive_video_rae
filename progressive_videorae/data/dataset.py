@@ -63,8 +63,15 @@ def decode_contiguous_clip(path: str, config: VideoSamplingConfig) -> tuple[Tens
         target_index = 0
         decoded_index = 0
         for frame in container.decode(stream):
-            frame_time = float(frame.pts * stream.time_base) if frame.pts is not None else decoded_index / native_fps
-            while target_index < len(timestamps) and frame_time + 0.5 / native_fps >= timestamps[target_index]:
+            frame_time = (
+                float(frame.pts * stream.time_base)
+                if frame.pts is not None
+                else decoded_index / native_fps
+            )
+            while (
+                target_index < len(timestamps)
+                and frame_time + 0.5 / native_fps >= timestamps[target_index]
+            ):
                 array = frame.to_ndarray(format="rgb24")
                 frames.append(torch.from_numpy(array))
                 frame_indices.append(decoded_index)
@@ -73,7 +80,9 @@ def decode_contiguous_clip(path: str, config: VideoSamplingConfig) -> tuple[Tens
             if target_index >= len(timestamps):
                 break
         if len(frames) != config.num_frames:
-            raise VideoDecodeError(f"Decoded {len(frames)}/{config.num_frames} target frames: {path}")
+            raise VideoDecodeError(
+                f"Decoded {len(frames)}/{config.num_frames} target frames: {path}"
+            )
 
     video = torch.stack(frames).permute(0, 3, 1, 2).float().div_(255.0)
     _, _, source_h, source_w = video.shape
@@ -161,6 +170,15 @@ class VideoManifestDataset(Dataset):
                 source_tags = source_tags.tolist()
             if isinstance(source_tags, str):
                 source_tags = [source_tags]
+            sampled_indices = metadata["sampled_frame_indices"]
+            sampled_timestamps = metadata["sampled_timestamps"]
+            identity_payload = (
+                f"{row.sample_id}|indices="
+                + ",".join(str(int(value)) for value in sampled_indices.tolist())
+                + "|timestamps="
+                + ",".join(f"{float(value):.9f}" for value in sampled_timestamps.tolist())
+            )
+            codec_sequence_id = identity_payload
             return {
                 "pixel_values": pixel_values,
                 "caption": "" if row.caption is None else str(row.caption),
@@ -168,14 +186,38 @@ class VideoManifestDataset(Dataset):
                 "sample_id": str(row.sample_id),
                 "category": str(row.category),
                 "source_tags": list(source_tags),
+                "codec_sequence_id": codec_sequence_id,
+                "is_sequence_start": torch.tensor(True, dtype=torch.bool),
+                "sequence_origin": "sampled_segment",
+                "segment_start_timestamp": sampled_timestamps[0].clone(),
                 **metadata,
             }
-        raise VideoDecodeError(f"Failed after {self.max_decode_retries + 1} attempts") from last_error
+        raise VideoDecodeError(
+            f"Failed after {self.max_decode_retries + 1} attempts"
+        ) from last_error
 
 
 def collate_video_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
-    tensor_keys = ("pixel_values", "sampled_timestamps", "sampled_frame_indices")
-    batch = {key: torch.stack([sample[key] for sample in samples]) for key in tensor_keys}
-    for key in ("caption", "path", "sample_id", "category", "source_tags", "native_fps"):
+    tensor_keys = (
+        "pixel_values",
+        "sampled_timestamps",
+        "sampled_frame_indices",
+        "is_sequence_start",
+        "segment_start_timestamp",
+    )
+    batch = {
+        key: torch.stack([sample[key] for sample in samples])
+        for key in tensor_keys
+    }
+    for key in (
+        "caption",
+        "path",
+        "sample_id",
+        "category",
+        "source_tags",
+        "native_fps",
+        "codec_sequence_id",
+        "sequence_origin",
+    ):
         batch[key] = [sample[key] for sample in samples]
     return batch

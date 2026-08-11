@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 from pathlib import Path
+
+from ..checksums import verify_checkpoint_sha256
 
 
 EXPECTED = {
@@ -12,13 +13,6 @@ EXPECTED = {
     "evaluation": ("evaluation/i3d_torchscript.pt", 100_000),
 }
 
-
-def sha256(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def validate_checkpoint_structure(model: str, path: Path) -> None:
@@ -78,15 +72,12 @@ def validate(root: Path, models: list[str], write_sha256: bool) -> None:
         if size < minimum_size:
             failures.append(f"too small ({size} bytes): {path}")
             continue
-        digest = sha256(path)
-        sidecar = path.with_suffix(path.suffix + ".sha256")
-        if sidecar.exists():
-            recorded = sidecar.read_text(encoding="utf-8").strip().split()[0]
-            if recorded != digest:
-                failures.append(f"SHA256 mismatch: {path}")
-                continue
-        if write_sha256:
-            sidecar.write_text(f"{digest}  {path.name}\n", encoding="utf-8")
+        try:
+            digest = verify_checkpoint_sha256(
+                path, create_missing_sidecar=write_sha256
+            )
+        except Exception as exc:
+            failures.append(f"invalid SHA256 identity ({exc}): {path}")
         try:
             validate_checkpoint_structure(model, path)
         except Exception as exc:

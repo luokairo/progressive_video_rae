@@ -56,7 +56,9 @@ class StateContract:
     temporal_mode: str = "native_vjepa_prefix_r4"
     decoder_mode: str = "rae_latent_causal_bridge_wan_native_r4"
     spatial_prefix_fill: str = "shared_zero_init_learnable_mask_v1"
+    prefix_indexing: str = "zero_based_inclusive_endpoint_v1"
     layout_version: str = "fps_v2_h30_w48_s48_k30"
+    layout_checksum: str = "00c67dda3753fe5c7f800b2f20d84a1116a9acfa07fcaf5b7281910d2048c535"
     height: int = 30
     width: int = 48
     channels: int = 48
@@ -85,6 +87,14 @@ class StateContract:
                 f"Incompatible StateContract: expected={self.to_dict()}, got={other.to_dict()}"
             )
 
+    def assert_layout_identity(self, *, version: str | None, checksum: str | None) -> None:
+        if version != self.layout_version or checksum != self.layout_checksum:
+            raise ValueError(
+                "State layout identity violates StateContract: "
+                f"expected=({self.layout_version}, {self.layout_checksum}), "
+                f"got=({version}, {checksum})"
+            )
+
 
 @dataclass
 class ProgressiveState:
@@ -107,16 +117,21 @@ class ProgressiveState:
             )
             if not bool(valid.all()):
                 raise ValueError("latent_types contains an unsupported value")
-        if self.contract is not None:
-            expected = (
-                self.contract.num_sets,
-                self.contract.tokens_per_set,
-                self.contract.channels,
+        if self.contract is None:
+            raise ValueError("ProgressiveState must carry a StateContract")
+        expected = (
+            self.contract.num_sets,
+            self.contract.tokens_per_set,
+            self.contract.channels,
+        )
+        if tuple(self.tokens.shape[2:]) != expected:
+            raise ValueError(
+                f"State shape {tuple(self.tokens.shape[2:])} violates contract {expected}"
             )
-            if tuple(self.tokens.shape[2:]) != expected:
-                raise ValueError(
-                    f"State shape {tuple(self.tokens.shape[2:])} violates contract {expected}"
-                )
+        self.contract.assert_layout_identity(
+            version=self.layout_version,
+            checksum=self.layout_checksum,
+        )
 
     @property
     def full_endpoint(self) -> int:
@@ -141,6 +156,22 @@ class SpatialPrefixView:
         if self.source is not None:
             if self.tokens.shape != self.source.tokens.shape:
                 raise ValueError("SpatialPrefixView must preserve the canonical state shape")
+            if self.contract is not None and self.contract != self.source.contract:
+                raise ValueError("SpatialPrefixView contract must match its source state")
+            if (
+                self.layout_version is not None
+                and self.layout_version != self.source.layout_version
+            ):
+                raise ValueError(
+                    "SpatialPrefixView layout identity version must match its source state"
+                )
+            if (
+                self.layout_checksum is not None
+                and self.layout_checksum != self.source.layout_checksum
+            ):
+                raise ValueError(
+                    "SpatialPrefixView layout identity checksum must match its source state"
+                )
             if self.latent_types is None:
                 self.latent_types = self.source.latent_types
             if self.contract is None:
@@ -151,6 +182,10 @@ class SpatialPrefixView:
                 self.layout_checksum = self.source.layout_checksum
         if self.contract is None:
             raise ValueError("SpatialPrefixView must carry a StateContract")
+        self.contract.assert_layout_identity(
+            version=self.layout_version,
+            checksum=self.layout_checksum,
+        )
         expected = (
             self.contract.num_sets,
             self.contract.tokens_per_set,

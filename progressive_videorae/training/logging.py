@@ -27,6 +27,7 @@ def resolve_training_log_file(
     output_dir: str | Path,
     *,
     resume_log_file: str | Path | None = None,
+    run_id: str | None = None,
     now: datetime | None = None,
 ) -> Path:
     """Choose a log file without changing checkpoint/output directory semantics.
@@ -38,6 +39,10 @@ def resolve_training_log_file(
 
     if resume_log_file:
         return Path(resume_log_file)
+    if run_id is not None:
+        if not run_id.strip() or Path(run_id).name != run_id:
+            raise ValueError("run_id must be one non-empty path component")
+        return Path(training["log_dir"]) / f"{training['stage']}_{run_id}.train.jsonl"
     if "log_dir" in training:
         return timestamped_log_path(training["log_dir"], str(training["stage"]), now=now)
     return Path(output_dir) / "train.jsonl"
@@ -89,7 +94,8 @@ class GlobalMetricWindow:
         self.prefix_bins = prefix_bins
         self._sums = torch.zeros(len(names), dtype=torch.float64, device=device)
         self._counts = torch.zeros(len(names), dtype=torch.float64, device=device)
-        self._histogram = torch.zeros(prefix_bins, dtype=torch.float64, device=device)
+        self._prefix_kinds = {"single": 0, "paired": 1}
+        self._histograms = torch.zeros(2, prefix_bins, dtype=torch.float64, device=device)
         self._logits = torch.zeros(_LOGIT_STAT_COUNT, dtype=torch.float64, device=device)
         self.steps = 0
 
@@ -110,12 +116,16 @@ class GlobalMetricWindow:
         self._sums[index].add_(self._scalar(value) * weight)
         self._counts[index].add_(weight)
 
-    def add_prefix(self, prefix_len: int, *, count: int | float = 1) -> None:
-        if prefix_len < 1 or prefix_len > self.prefix_bins:
-            raise ValueError(f"prefix_len must be in [1, {self.prefix_bins}]")
+    def add_prefix(
+        self, endpoint: int, *, kind: str = "single", count: int | float = 1
+    ) -> None:
+        if endpoint < 0 or endpoint >= self.prefix_bins:
+            raise ValueError(f"endpoint must be in [0, {self.prefix_bins - 1}]")
+        if kind not in self._prefix_kinds:
+            raise ValueError(f"Unsupported prefix kind: {kind}")
         if count < 0:
             raise ValueError("Prefix count must be non-negative")
-        self._histogram[prefix_len - 1].add_(float(count))
+        self._histograms[self._prefix_kinds[kind], endpoint].add_(float(count))
 
     def add_logits(self, real_logits: Tensor, fake_logits: Tensor) -> None:
         for offset, logits in ((0, real_logits), (3, fake_logits)):
@@ -127,16 +137,21 @@ class GlobalMetricWindow:
     def step(self) -> None:
         self.steps += 1
 
-    def reduce(self) -> tuple[dict[str, float], dict[str, int]]:
-        payload = torch.cat((self._sums, self._counts, self._histogram, self._logits))
+    def reduce(self) -> tuple[dict[str, float], dict[str, dict[str, int]]]:
+        payload = torch.cat(
+            (self._sums, self._counts, self._histograms.flatten(), self._logits)
+        )
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.all_reduce(payload, op=torch.distributed.ReduceOp.SUM)
 
         split = len(self.names)
         sums = payload[:split]
         counts = payload[split : 2 * split]
-        histogram = payload[2 * split : 2 * split + self.prefix_bins]
-        logits = payload[2 * split + self.prefix_bins :]
+        histogram_size = 2 * self.prefix_bins
+        histograms = payload[2 * split : 2 * split + histogram_size].reshape(
+            2, self.prefix_bins
+        )
+        logits = payload[2 * split + histogram_size :]
 
         metrics = {
             name: float((sums[index] / counts[index]).cpu())
@@ -151,17 +166,20 @@ class GlobalMetricWindow:
                 metrics[f"disc/{name}_logit_mean"] = float(mean.cpu())
                 metrics[f"disc/{name}_logit_std"] = float(variance.sqrt().cpu())
 
-        prefix_histogram = {
-            str(index + 1): int(value.item())
-            for index, value in enumerate(histogram)
-            if value > 0
+        prefix_histograms = {
+            kind: {
+                str(endpoint): int(value.item())
+                for endpoint, value in enumerate(histograms[kind_index])
+                if value > 0
+            }
+            for kind, kind_index in self._prefix_kinds.items()
         }
-        return metrics, prefix_histogram
+        return metrics, prefix_histograms
 
     def reset(self) -> None:
         self._sums.zero_()
         self._counts.zero_()
-        self._histogram.zero_()
+        self._histograms.zero_()
         self._logits.zero_()
         self.steps = 0
 

@@ -3,7 +3,14 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from progressive_videorae.model.projector import CausalFrequencyProjector
-from progressive_videorae.model.types import PrefixEncoderOutput, PrefixGroupFeatures
+from progressive_videorae.model.progressive_sets import LAYOUT_CHECKSUM, LAYOUT_VERSION
+from progressive_videorae.model.types import (
+    PrefixEncoderOutput,
+    PrefixGroupFeatures,
+    ProgressiveState,
+    SpatialPrefixView,
+    StateContract,
+)
 
 
 def make_features(tensor):
@@ -74,3 +81,26 @@ def test_full_state_and_phase_specific_repa_shapes():
     assert output.state.tokens.shape == (1, 2, 48, 30, 48)
     assert output.repa_reference.anchor.shape == (1, 1, 30, 48, 8)
     assert output.repa_reference.video_phases.shape == (1, 1, 2, 30, 48, 8)
+
+
+def test_candidate_v3_contract_binds_fixed_prefix_indexing_and_layout_checksum():
+    projector = make_projector()
+    state = projector(make_features(torch.randn(1, 1, 30, 48, 8))).state
+    view = projector.make_prefix_view(state, 12)
+    contract = projector.contract
+    assert contract.prefix_indexing == "zero_based_inclusive_endpoint_v1"
+    assert contract.layout_version == LAYOUT_VERSION
+    assert contract.layout_checksum == LAYOUT_CHECKSUM
+    for value in (state, view):
+        assert value.layout_version == LAYOUT_VERSION
+        assert value.layout_checksum == LAYOUT_CHECKSUM
+
+
+def test_state_and_view_construction_reject_layout_identity_mismatch():
+    tokens = torch.randn(1, 1, 48, 30, 48)
+    contract = StateContract()
+    with pytest.raises(ValueError, match="layout identity"):
+        ProgressiveState(tokens, LAYOUT_VERSION, "tampered", contract=contract)
+    source = ProgressiveState(tokens, LAYOUT_VERSION, LAYOUT_CHECKSUM, contract=contract)
+    with pytest.raises(ValueError, match="layout identity"):
+        SpatialPrefixView(tokens, 3, source=source, layout_checksum="tampered")

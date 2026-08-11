@@ -25,7 +25,7 @@ def test_metric_window_reports_global_means_logits_and_prefix_histogram():
     window.add_mean("loss", 4.0)
     window.add_mean("grad", 5.0)
     window.add_prefix(1, count=2)
-    window.add_prefix(64)
+    window.add_prefix(47, kind="paired")
     window.add_logits(torch.tensor([1.0, 3.0]), torch.tensor([-1.0, 1.0]))
 
     metrics, histogram = window.reduce()
@@ -36,7 +36,7 @@ def test_metric_window_reports_global_means_logits_and_prefix_histogram():
     assert metrics["disc/real_logit_std"] == pytest.approx(1.0)
     assert metrics["disc/fake_logit_mean"] == pytest.approx(0.0)
     assert metrics["disc/fake_logit_std"] == pytest.approx(1.0)
-    assert histogram == {"1": 2, "64": 1}
+    assert histogram == {"single": {"1": 2}, "paired": {"47": 1}}
 
 
 def test_metric_window_uses_distributed_sum_when_initialized(monkeypatch):
@@ -60,7 +60,7 @@ def test_metric_window_uses_distributed_sum_when_initialized(monkeypatch):
     assert metrics["disc/real_logit_std"] == pytest.approx(1.0)
     assert metrics["disc/fake_logit_mean"] == pytest.approx(-1.0)
     assert metrics["disc/fake_logit_std"] == pytest.approx(1.0)
-    assert histogram == {"4": 2}
+    assert histogram == {"single": {"4": 2}, "paired": {}}
 
 
 def test_gradient_norm_uses_only_present_gradients():
@@ -159,7 +159,8 @@ def test_checkpoint_stores_log_file(tmp_path):
     discriminator_scheduler = torch.optim.lr_scheduler.LambdaLR(
         discriminator_optimizer, lambda _step: 1.0
     )
-    log_file = "/share/project/liujingyi/logs/waverae/progressive_video_rae/stage1/stage1a_20260808T121234123456Z.train.jsonl"
+    run_id = "20260808T121234123456Z"
+    log_file = f"/share/project/liujingyi/logs/waverae/progressive_video_rae/stage1a_{run_id}.train.jsonl"
     checkpoint_path = tmp_path / "checkpoint.pt"
 
     save_checkpoint(
@@ -175,11 +176,17 @@ def test_checkpoint_stores_log_file(tmp_path):
         epoch=1,
         config={},
         log_file=log_file,
+        run_id=run_id,
+        checkpoint_dir=str(tmp_path),
+        source_checkpoint="/external/source.pt",
         update_latest=True,
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     assert checkpoint["log_file"] == log_file
+    assert checkpoint["run_id"] == run_id
+    assert checkpoint["checkpoint_dir"] == str(tmp_path)
+    assert checkpoint["source_checkpoint"] == "/external/source.pt"
     latest = tmp_path / "latest.pt"
     assert latest.is_symlink()
     assert latest.resolve() == checkpoint_path.resolve()

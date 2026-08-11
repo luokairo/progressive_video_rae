@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor, nn
 
-from .progressive_sets import LAYOUT_VERSION, SET_SIZES, build_progressive_layout
+from .progressive_sets import LAYOUT_CHECKSUM, LAYOUT_VERSION, SET_SIZES, build_progressive_layout
 from .types import (
     IMAGE_FIRST_ID,
     VIDEO_GROUP_ID,
@@ -56,6 +56,10 @@ class CausalFrequencyProjector(nn.Module):
         self.layout_version = layout.version
         self.layout_checksum = layout.checksum
         traversal = torch.tensor(layout.traversal, dtype=torch.long)
+        if layout.checksum != LAYOUT_CHECKSUM:
+            raise ValueError(
+                f"candidate v3 layout checksum mismatch: {layout.checksum} != {LAYOUT_CHECKSUM}"
+            )
         inverse = torch.empty_like(traversal)
         inverse[traversal] = torch.arange(traversal.numel())
         self.register_buffer("fps_permutation", traversal, persistent=True)
@@ -76,6 +80,7 @@ class CausalFrequencyProjector(nn.Module):
             tokens_per_set=30,
             layout_version=layout.version,
             max_encoder_context_frames=max_context_frames,
+            layout_checksum=layout.checksum,
         )
 
         self.layer_mix_logits = nn.Parameter(torch.zeros(num_input_layers))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
+import copy
 import json
 import math
 import os
@@ -21,8 +22,25 @@ from .config import load_training_bundle
 from .data import DistributedFullDatasetSampler, VideoManifestDataset, collate_video_samples
 from .model.dct import dct_lowpass_target
 from .model.factory import build_model
-from .training.checkpoint import load_checkpoint, load_decoder_from_checkpoint, save_checkpoint, unwrap
-from .training.logging import append_jsonl_record, gradient_norm, resolve_training_log_file
+from .training.checkpoint import (
+    load_checkpoint,
+    representation_identity,
+    save_checkpoint,
+    verify_pretrained_checkpoint_hashes,
+    unwrap,
+)
+from .training.logging import (
+    GlobalMetricWindow,
+    append_jsonl_record,
+    gradient_norm,
+    resolve_training_log_file,
+)
+from .training.paths import (
+    resolve_training_run_paths,
+    utc_run_id,
+    validate_external_absolute_path,
+    validate_resume_log_file,
+)
 from .training.losses import PatchDiscriminator, ProgressiveLosses
 from .training.stages import (
     adversarial_factor,
@@ -30,7 +48,24 @@ from .training.stages import (
     sample_microbatch_tasks,
     stage1a_phase,
     validate_stage_objective,
+    validate_training_batch,
+    validate_training_bundle,
 )
+
+
+def broadcast_rank0_object(value: Any, *, rank: int) -> Any:
+    payload = [value if rank == 0 else None]
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        torch.distributed.broadcast_object_list(payload, src=0)
+    elif rank != 0:
+        raise RuntimeError("Nonzero rank requires an initialized distributed process group")
+    result = payload[0]
+    if result is None:
+        raise RuntimeError("Rank 0 broadcast returned no payload")
+    return result
 
 
 def distributed_context() -> tuple[int, int, int]:
@@ -40,6 +75,35 @@ def distributed_context() -> tuple[int, int, int]:
     if world_size > 1 and not torch.distributed.is_initialized():
         torch.distributed.init_process_group(backend="nccl")
     return rank, local_rank, world_size
+
+
+def distributed_run_id(*, rank: int, resume_checkpoint: str | None) -> str:
+    if resume_checkpoint is not None:
+        return Path(resume_checkpoint).expanduser().resolve().parent.name
+    return str(broadcast_rank0_object(utc_run_id() if rank == 0 else None, rank=rank))
+
+
+def distributed_verified_representation_identity(
+    model: nn.Module, *, rank: int
+) -> dict[str, Any]:
+    result: dict[str, Any] | None = None
+    if rank == 0:
+        try:
+            hashes = verify_pretrained_checkpoint_hashes(
+                model, create_missing_sidecars=True
+            )
+        except Exception as exc:
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        else:
+            result = {"ok": True, "hashes": hashes}
+    result = broadcast_rank0_object(result, rank=rank)
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        error = result.get("error") if isinstance(result, dict) else repr(result)
+        raise RuntimeError(f"Rank 0 pretrained SHA256 preflight failed: {error}")
+    hashes = result.get("hashes")
+    if not isinstance(hashes, dict):
+        raise RuntimeError("Rank 0 SHA256 preflight returned no verified hashes")
+    return representation_identity(model, checkpoint_hashes=hashes)
 
 
 def seed_everything(seed: int, rank: int) -> None:
@@ -198,7 +262,11 @@ def verify_optimizer_gradients_synchronized(optimizer: torch.optim.Optimizer) ->
         return
     world_size = torch.distributed.get_world_size()
     for group_index, group in enumerate(optimizer.param_groups):
-        gradients = [parameter.grad.detach() for parameter in group["params"] if parameter.grad is not None]
+        gradients = [
+            parameter.grad.detach()
+            for parameter in group["params"]
+            if parameter.grad is not None
+        ]
         device = group["params"][0].device
         if gradients:
             checksum = torch.stack(
@@ -213,7 +281,10 @@ def verify_optimizer_gradients_synchronized(optimizer: torch.optim.Optimizer) ->
         gathered = [torch.empty_like(checksum) for _ in range(world_size)]
         torch.distributed.all_gather(gathered, checksum)
         reference = gathered[0]
-        if any(not torch.allclose(value, reference, rtol=1e-6, atol=1e-6) for value in gathered[1:]):
+        if any(
+            not torch.allclose(value, reference, rtol=1e-6, atol=1e-6)
+            for value in gathered[1:]
+        ):
             name = group.get("name", str(group_index))
             raise RuntimeError(f"DDP gradient mismatch for optimizer group {name}")
 
@@ -254,11 +325,27 @@ def build_optimizers(model, discriminator, config: dict[str, Any]):
             interface.extend(child.parameters())
     interface = _unique(interface)
     used = {id(parameter) for parameter in fast + interface}
-    spatial = [parameter for parameter in module.decoder.parameters() if id(parameter) not in used]
+    spatial = [
+        parameter
+        for parameter in module.decoder.parameters()
+        if id(parameter) not in used
+    ]
     groups = [
-        {"params": fast, "lr": float(config.get("projector_lr", 1e-4)), "name": "rae_fast"},
-        {"params": interface, "lr": float(config.get("wan_temporal_lr", 2e-5)), "name": "wan_temporal"},
-        {"params": spatial, "lr": float(config.get("wan_spatial_lr", 5e-6)), "name": "wan_spatial"},
+        {
+            "params": fast,
+            "lr": float(config.get("projector_lr", 1e-4)),
+            "name": "rae_fast",
+        },
+        {
+            "params": interface,
+            "lr": float(config.get("wan_temporal_lr", 2e-5)),
+            "name": "wan_temporal",
+        },
+        {
+            "params": spatial,
+            "lr": float(config.get("wan_spatial_lr", 5e-6)),
+            "name": "wan_spatial",
+        },
     ]
     fused = bool(config.get("fused_optimizer", False))
     generator = torch.optim.AdamW(
@@ -306,6 +393,8 @@ def verify_upstream_commit(source_root: str, expected_commit: str, component: st
 
 def _sequence_id(batch: dict[str, Any]) -> str:
     ids = []
+    if "codec_sequence_id" in batch:
+        return "|".join(batch["codec_sequence_id"])
     for sample_id, frame_indices, timestamps in zip(
         batch["sample_id"],
         batch["sampled_frame_indices"],
@@ -329,6 +418,26 @@ def _prefix_loss(losses, output, pixel_values, endpoint, previous_prediction=Non
             endpoint=endpoint,
             full_target=full_target,
             previous_prediction=previous_prediction,
+        )
+
+PREFIX_WINDOW_TERMS = ("l1", "band", "leakage", "paired_delta")
+
+
+def _prefix_window_metric_names() -> tuple[str, ...]:
+    return tuple(
+        f"prefix/{kind}/endpoint_{endpoint:02d}/{term}"
+        for kind in ("single", "paired")
+        for endpoint in range(48)
+        for term in PREFIX_WINDOW_TERMS
+    )
+
+
+def record_prefix_window(window, *, kind: str, endpoint: int, loss) -> None:
+    window.add_prefix(endpoint, kind=kind)
+    for term in PREFIX_WINDOW_TERMS:
+        window.add_mean(
+            f"prefix/{kind}/endpoint_{endpoint:02d}/{term}",
+            loss.terms[term],
         )
 
 
@@ -361,7 +470,7 @@ def validate_resume_training_contract(
     saved = saved_bundle.get("training") if isinstance(saved_bundle, dict) else None
     if not isinstance(saved, dict):
         raise RuntimeError("Resume checkpoint is missing its resolved training config")
-    keys = ("micro_batch_size", "gradient_accumulation_steps", "global_batch_size")
+    keys = ("micro_batch_size", "gradient_accumulation_steps", "global_batch_size", "max_steps")
     if training.get("stage") == "stage1a":
         keys += (
             "wan_interface_step",
@@ -389,12 +498,12 @@ def main() -> None:
     parser.add_argument("--model-config", default=None)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--init-from", default=None)
-    parser.add_argument("--init-decoder-from", default=None)
+    parser.add_argument("--allow-smoke-checkpoint", action="store_true")
     parser.add_argument("--set", action="append", default=[])
     parser.add_argument("--seed", type=int, default=20260807)
     args = parser.parse_args()
-    if sum(value is not None for value in (args.resume, args.init_from, args.init_decoder_from)) > 1:
-        parser.error("--resume, --init-from and --init-decoder-from are mutually exclusive")
+    if args.resume is not None and args.init_from is not None:
+        parser.error("--resume and --init-from are mutually exclusive")
     if not torch.cuda.is_available():
         raise RuntimeError("Training requires CUDA")
 
@@ -402,6 +511,7 @@ def main() -> None:
     for expression in args.set:
         _set_nested(bundle, expression)
     training, model_config, data_config = bundle["training"], bundle["model"], bundle["data"]
+    expected_frames, _ = validate_training_bundle(training, model_config, data_config)
     objective_mode = validate_stage_objective(training)
     verify_upstream_commit(
         model_config["encoder"]["source_root"],
@@ -414,12 +524,22 @@ def main() -> None:
         "Wan2.2",
     )
     stage = training["stage"]
+    if stage == "stage1a" and args.init_from is not None:
+        parser.error("Stage 1-A must start fresh; --init-from is not allowed")
+    if stage != "stage1a" and args.resume is None and args.init_from is None:
+        parser.error(f"{stage} requires --init-from from the previous completed stage")
+    run_mode = "smoke" if args.allow_smoke_checkpoint else "formal"
+
     rank, local_rank, world_size = distributed_context()
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     seed_everything(args.seed, rank)
 
-    expected_global = training["micro_batch_size"] * training["gradient_accumulation_steps"] * world_size
+    expected_global = (
+        training["micro_batch_size"]
+        * training["gradient_accumulation_steps"]
+        * world_size
+    )
     if expected_global != training["global_batch_size"]:
         raise ValueError("global_batch_size does not match the distributed topology")
 
@@ -455,24 +575,41 @@ def main() -> None:
     )
     cycling = CyclingLoader(loader, sampler)
 
-    output_dir = Path(training["output_dir"])
-    existing_checkpoints = tuple(output_dir.glob("step_*.pt"))
-    if not args.resume and existing_checkpoints:
-        raise FileExistsError(
-            f"Refusing to overwrite existing checkpoints in {output_dir}; use --resume"
+    run_id = distributed_run_id(rank=rank, resume_checkpoint=args.resume)
+    run_paths = resolve_training_run_paths(
+        training,
+        stage=stage,
+        run_id=run_id,
+        resume_checkpoint=args.resume,
+    )
+    checkpoint_dir = run_paths.checkpoint_dir
+    source_checkpoint = (
+        str(Path(args.resume or args.init_from).expanduser().resolve())
+        if args.resume or args.init_from
+        else None
+    )
+    if args.init_from is not None and not args.allow_smoke_checkpoint:
+        source_path = validate_external_absolute_path(
+            args.init_from, label="init-from checkpoint"
         )
+        if not source_path.is_relative_to(
+            run_paths.checkpoint_root
+        ):
+            raise ValueError("Formal init-from checkpoint must be under checkpoint_root")
+    if not args.resume and tuple(checkpoint_dir.glob("step_*.pt")):
+        raise FileExistsError(f"Refusing to overwrite existing run: {checkpoint_dir}")
     if rank == 0:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / "resolved_config.json").write_text(
-            json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if world_size > 1:
+        torch.distributed.barrier()
 
     model = build_model(model_config, validate_pretrained=False)
     report = preflight_pretrained_weights(
-        model, output_dir / "pretrained_load_report.json" if rank == 0 else None
+        model, checkpoint_dir / "pretrained_load_report.json" if rank == 0 else None
     )
     if rank == 0:
         print(json.dumps({"pretrained": report}, ensure_ascii=False), flush=True)
+    static_identity = distributed_verified_representation_identity(model, rank=rank)
     model = model.to(device)
     active_phase = training_phase(training, 0)
     configure_stage(
@@ -504,7 +641,9 @@ def main() -> None:
         leakage_weight=training.get("leakage_weight", 0.1),
         paired_delta_weight=training.get("paired_delta_weight", 1.0),
     ).to(device)
-    generator_optimizer, discriminator_optimizer = build_optimizers(model, discriminator, training)
+    generator_optimizer, discriminator_optimizer = build_optimizers(
+        model, discriminator, training
+    )
     generator_scheduler = cosine_scheduler(
         generator_optimizer, training["warmup_steps"], training["max_steps"]
     )
@@ -514,11 +653,19 @@ def main() -> None:
 
     optimizer_step = 0
     discriminator_update_count = 0
-    if args.init_decoder_from:
-        load_decoder_from_checkpoint(args.init_decoder_from, model=model)
-    if args.init_from:
-        load_checkpoint(args.init_from, model=model, discriminator=discriminator, restore_rng=False)
     checkpoint = None
+    if args.init_from:
+        load_checkpoint(
+            args.init_from,
+            model=model,
+            discriminator=discriminator,
+            restore_rng=False,
+            static_identity=static_identity,
+            target_stage=stage,
+            target_objective_mode=objective_mode,
+            load_mode="init",
+            allow_smoke_checkpoint=args.allow_smoke_checkpoint,
+        )
     if args.resume:
         checkpoint = load_checkpoint(
             args.resume,
@@ -528,21 +675,54 @@ def main() -> None:
             discriminator_optimizer=discriminator_optimizer,
             generator_scheduler=generator_scheduler,
             discriminator_scheduler=discriminator_scheduler,
+            static_identity=static_identity,
+            target_stage=stage,
+            target_objective_mode=objective_mode,
+            load_mode="resume",
+            allow_smoke_checkpoint=args.allow_smoke_checkpoint,
         )
-        if checkpoint.get("stage") != stage or checkpoint.get("objective_mode") != objective_mode:
-            raise RuntimeError("Resume checkpoint stage/objective mismatch")
         validate_resume_training_contract(checkpoint, training)
+        if checkpoint.get("run_id") != run_id:
+            raise RuntimeError("Resume checkpoint run_id does not match its run directory")
+        saved_checkpoint_dir = checkpoint.get("checkpoint_dir")
+        if not isinstance(saved_checkpoint_dir, str) or (
+            Path(saved_checkpoint_dir).expanduser().resolve() != checkpoint_dir
+        ):
+            raise RuntimeError("Resume checkpoint records a different checkpoint directory")
+        if not isinstance(checkpoint.get("log_file"), str):
+            raise RuntimeError("Resume checkpoint is missing its original log_file")
+
         optimizer_step = int(checkpoint["optimizer_step"])
         discriminator_update_count = int(checkpoint.get("discriminator_update_count", 0))
         cycling.epoch = int(checkpoint["epoch"])
         cycling.sampler.set_epoch(cycling.epoch)
         cycling.iterator = iter(cycling.loader)
 
-    log_file = resolve_training_log_file(
-        training,
-        output_dir,
-        resume_log_file=(checkpoint or {}).get("log_file") if args.resume else None,
-    )
+    if args.resume:
+        log_file = validate_resume_log_file(
+            checkpoint["log_file"],
+            log_root=run_paths.log_root,
+        )
+    else:
+        log_file = resolve_training_log_file(
+            training,
+            checkpoint_dir,
+            run_id=run_id,
+        )
+    resolved_bundle = copy.deepcopy(bundle)
+    resolved_bundle["runtime"] = {
+        "run_id": run_id,
+        "checkpoint_dir": str(checkpoint_dir),
+        "log_file": str(log_file),
+        "source_checkpoint": source_checkpoint,
+    }
+    bundle = resolved_bundle
+    if rank == 0:
+        (checkpoint_dir / "resolved_config.json").write_text(
+            json.dumps(bundle, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+    if world_size > 1:
+        torch.distributed.barrier()
     append_jsonl_record(
         log_file,
         {
@@ -550,12 +730,18 @@ def main() -> None:
             "step": optimizer_step,
             "stage": stage,
             "objective_mode": objective_mode,
+            "run_mode": run_mode,
         },
         rank=rank,
     )
 
     autocast_dtype = torch.bfloat16 if training["precision"] == "bf16" else torch.float16
     accumulation = int(training["gradient_accumulation_steps"])
+    prefix_objective_weight = float(training.get("prefix_objective_weight", 1.0))
+    prefix_window = GlobalMetricWindow(
+        _prefix_window_metric_names(), device=device, prefix_bins=48
+    )
+
     while optimizer_step < training["max_steps"]:
         started = time.perf_counter()
         torch.cuda.reset_peak_memory_stats(device)
@@ -595,6 +781,13 @@ def main() -> None:
         for micro_index, task in enumerate(tasks):
             data_started = time.perf_counter()
             batch = cycling.next()
+            validate_training_batch(
+                batch,
+                stage=stage,
+                expected_frames=expected_frames,
+                expected_height=int(data_config["height"]),
+                expected_width=int(data_config["width"]),
+            )
             pixel_values = batch["pixel_values"].to(device, non_blocking=True)
             data_seconds += time.perf_counter() - data_started
             last_micro = micro_index == len(tasks) - 1
@@ -633,7 +826,16 @@ def main() -> None:
                         parameter.requires_grad_(True)
                 elif task.kind == "single_prefix":
                     assert not isinstance(result, tuple)
-                    generator_loss = _prefix_loss(losses, result, pixel_values, task.endpoint)
+                    generator_loss = _prefix_loss(
+                        losses, result, pixel_values, task.endpoint
+                    )
+                    generator_loss.total = prefix_objective_weight * generator_loss.total
+                    record_prefix_window(
+                        prefix_window,
+                        kind="single",
+                        endpoint=task.endpoint,
+                        loss=generator_loss,
+                    )
                 else:
                     assert isinstance(result, tuple)
                     previous, current = result
@@ -648,7 +850,12 @@ def main() -> None:
                         previous_prediction=previous.reconstruction,
                     )
                     generator_loss = current_loss
-                    generator_loss.total = 0.5 * (previous_loss.total + current_loss.total)
+                    generator_loss.total = prefix_objective_weight * 0.5 * (
+                        previous_loss.total + current_loss.total
+                    )
+                    record_prefix_window(
+                        prefix_window, kind="paired", endpoint=task.endpoint, loss=current_loss
+                    )
                 assert_finite_distributed(generator_loss.total, "generator")
                 timing.stop("loss", loss_event)
                 backward_event = timing.start()
@@ -661,7 +868,11 @@ def main() -> None:
             for name, value in generator_loss.terms.items():
                 metrics[name] = metrics.get(name, 0.0) + float(value.detach()) / len(tasks)
 
+            for name, value in generator_loss.statistics.items():
+                metrics[name] = metrics.get(name, 0.0) + float(value.detach()) / len(tasks)
+
         optimizer_event = timing.start()
+        prefix_window.step()
         generator_parameters = [
             parameter
             for group in generator_optimizer.param_groups
@@ -701,6 +912,8 @@ def main() -> None:
 
         if optimizer_step % training["log_every"] == 0:
             metrics = reduce_scalar_metrics(metrics, device)
+            prefix_metrics, prefix_histograms = prefix_window.reduce()
+            metrics.update(prefix_metrics)
 
         if rank == 0 and optimizer_step % training["log_every"] == 0:
             cuda_timings = timing.resolve()
@@ -729,11 +942,18 @@ def main() -> None:
                 "schedule/phase": active_phase,
                 "system/gradient_checkpointing": int(checkpoint_enabled),
                 "schedule/task_counts": task_counts,
-                "lr": {group.get("name", str(i)): group["lr"] for i, group in enumerate(generator_optimizer.param_groups)},
+                "prefix/single_endpoint_histogram": prefix_histograms["single"],
+                "prefix/paired_endpoint_histogram": prefix_histograms["paired"],
+                "lr": {
+                    group.get("name", str(i)): group["lr"]
+                    for i, group in enumerate(generator_optimizer.param_groups)
+                },
                 **metrics,
             }
             print(json.dumps(record, ensure_ascii=False), flush=True)
             append_jsonl_record(log_file, record, rank=rank)
+        if optimizer_step % training["log_every"] == 0:
+            prefix_window.reset()
 
         save_at_steps = {int(value) for value in training.get("save_at_steps", [])}
         should_save = (
@@ -746,7 +966,7 @@ def main() -> None:
                 torch.distributed.barrier()
             if rank == 0:
                 save_checkpoint(
-                    output_dir / f"step_{optimizer_step:08d}.pt",
+                    checkpoint_dir / f"step_{optimizer_step:08d}.pt",
                     model=model,
                     discriminator=discriminator,
                     generator_optimizer=generator_optimizer,
@@ -760,6 +980,10 @@ def main() -> None:
                     stage=stage,
                     objective_mode=objective_mode,
                     log_file=str(log_file),
+                    run_id=run_id,
+                    checkpoint_dir=str(checkpoint_dir),
+                    source_checkpoint=source_checkpoint,
+                    static_identity=static_identity,
                     update_latest=True,
                 )
             if world_size > 1:
