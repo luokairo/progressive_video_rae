@@ -77,3 +77,61 @@ def frequency_leakage(prediction: Tensor, endpoint: int, eps: float = 1e-8) -> T
     total = energy.sum(dim=(-2, -1))
     allowed = energy[:, : cutoff.height, : cutoff.width].sum(dim=(-2, -1))
     return ((total - allowed) / total.clamp_min(eps)).mean()
+
+
+@dataclass(frozen=True)
+class ProgressiveFrequencyTerms:
+    target: Tensor
+    target_coefficients: Tensor
+    prediction_coefficients: Tensor
+    band_mask: Tensor
+    leakage: Tensor
+
+
+def progressive_frequency_terms(
+    prediction: Tensor,
+    full_target: Tensor,
+    endpoint: int,
+    *,
+    eps: float = 1e-8,
+) -> ProgressiveFrequencyTerms:
+    if prediction.shape != full_target.shape:
+        raise ValueError(
+            f"Progressive frequency shape mismatch: {prediction.shape} vs {full_target.shape}"
+        )
+
+    target_coefficients, shape = _dct(full_target)
+    prediction_coefficients, prediction_shape = _dct(prediction)
+    if prediction_shape != shape:
+        raise ValueError("Prediction and target DCT shapes must match")
+
+    cutoff = frequency_cutoff(endpoint, shape[-2], shape[-1])
+    previous = frequency_cutoff(endpoint - 1, shape[-2], shape[-1]) if endpoint else None
+    band_mask = torch.zeros_like(target_coefficients, dtype=torch.bool)
+    band_mask[:, : cutoff.height, : cutoff.width] = True
+    if previous is not None:
+        band_mask[:, : previous.height, : previous.width] = False
+
+    if endpoint == NUM_PROGRESSIVE_SETS - 1:
+        target = full_target
+    else:
+        masked = torch.zeros_like(target_coefficients)
+        masked[:, : cutoff.height, : cutoff.width] = target_coefficients[
+            :, : cutoff.height, : cutoff.width
+        ]
+        target = _restore(masked, shape)
+
+    if endpoint == NUM_PROGRESSIVE_SETS - 1:
+        leakage = prediction_coefficients.sum() * 0.0
+    else:
+        energy = prediction_coefficients.square()
+        total = energy.sum(dim=(-2, -1))
+        allowed = energy[:, : cutoff.height, : cutoff.width].sum(dim=(-2, -1))
+        leakage = ((total - allowed) / total.clamp_min(eps)).mean()
+    return ProgressiveFrequencyTerms(
+        target=target,
+        target_coefficients=target_coefficients,
+        prediction_coefficients=prediction_coefficients,
+        band_mask=band_mask,
+        leakage=leakage,
+    )

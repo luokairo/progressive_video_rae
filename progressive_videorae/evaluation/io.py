@@ -25,8 +25,8 @@ def save_comparison_video(
     grid = np.concatenate(arrays, axis=2)
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with av.open(str(path), mode="w") as container:
-        stream = container.add_stream("mpeg4", rate=round(fps))
+    with av.open(str(path), mode="w", options={"movflags": "+faststart"}) as container:
+        stream = container.add_stream("libx264", rate=round(fps))
         stream.width = grid.shape[2]
         stream.height = grid.shape[1]
         stream.pix_fmt = "yuv420p"

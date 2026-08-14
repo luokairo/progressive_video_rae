@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+
 import pytest
 import torch
 from torch import nn
@@ -13,7 +15,10 @@ from progressive_videorae.training.stages import (
     validate_stage_objective,
     validate_training_bundle,
 )
-from progressive_videorae.train import validate_resume_training_contract
+from progressive_videorae.train import (
+    build_optimizers,
+    validate_resume_training_contract,
+)
 
 
 def test_stage1a_phase_boundaries_are_exact():
@@ -26,24 +31,42 @@ def test_stage1a_phase_boundaries_are_exact():
         stage1a_phase(0, wan_interface_step=5, wan_full_step=4)
 
 
-def test_stage1b_plan_is_exactly_4_full_3_single_1_pair():
+def test_stage1b_plan_is_exactly_7_random_prefixes_and_1_p47_full():
     config = load_training_bundle("configs/train/stage1b.yaml")["training"]
-    assert validate_stage_objective(config) == "full_repa_spatial_prefix"
+    assert validate_stage_objective(config) == "nested_spectral_hrepa_full_anchor"
     tasks = sample_microbatch_tasks("stage1b", 8, optimizer_step=0)
     kinds = [task.kind for task in tasks]
-    assert kinds.count("full") == 4
-    assert kinds.count("single_prefix") == 3
-    assert kinds.count("paired_prefix") == 1
-    pair = next(task for task in tasks if task.kind == "paired_prefix")
-    assert pair.previous_endpoint == pair.endpoint - 1
+    prefix_tasks = [task for task in tasks if not task.is_full]
+
+    assert kinds.count("full") == 1
+    assert kinds.count("single_prefix") == 7
+    assert kinds.count("paired_prefix") == 0
+    assert len(prefix_tasks) == 7
+    assert all(0 <= task.endpoint <= 46 for task in prefix_tasks)
+    assert all(task.previous_endpoint is None for task in tasks)
 
 
-def test_stage1b_resume_rejects_new_four_microbatch_schedule():
+def test_stage1b_random_prefixes_are_approximately_uniform():
+    rng_state = random.getstate()
+    random.seed(20260811)
+    counts = [0] * 47
+    try:
+        for step in range(4700):
+            for task in sample_microbatch_tasks("stage1b", 8, optimizer_step=step):
+                if not task.is_full:
+                    counts[task.endpoint] += 1
+    finally:
+        random.setstate(rng_state)
+
+    expected = sum(counts) / len(counts)
+    assert expected == pytest.approx(700.0)
+    assert max(abs(count - expected) for count in counts) < expected * 0.15
+
+
+def test_stage1b_resume_rejects_schedule_contract_change():
     training = load_training_bundle("configs/train/stage1b.yaml")["training"]
     saved = dict(training)
-    saved["gradient_accumulation_steps"] = 4
-    saved["global_batch_size"] = 32
-    saved["prefix_schedule"] = "alternating_2step_2full_2single__2full_1single_1pair"
+    saved["p47_full_microbatches_per_step"] = 0
 
     with pytest.raises(RuntimeError, match="Resume training contract mismatch"):
         validate_resume_training_contract({"config": {"training": saved}}, training)
@@ -60,6 +83,13 @@ def test_stage2_plans_are_full_only_and_keep_repa_objective(stage):
 def test_stage2_rejects_any_prefix_configuration():
     config = load_training_bundle("configs/train/stage2a.yaml")["training"]
     config["prefix_schedule"] = "full"
+    with pytest.raises(ValueError, match="forbids prefix/DCT/mask-replacement"):
+        validate_stage_objective(config)
+
+
+def test_stage2_rejects_stage1b_decoder_policy():
+    config = load_training_bundle("configs/train/stage2a.yaml")["training"]
+    config["decoder_trainable_policy"] = "temporal_interface"
     with pytest.raises(ValueError, match="forbids prefix/DCT/mask-replacement"):
         validate_stage_objective(config)
 
@@ -144,6 +174,7 @@ def test_stage1a_trainable_ownership_changes_at_boundaries():
     assert model.decoder.temporal_adapter.weight.requires_grad
     assert not model.decoder.pre_decoder.weight.requires_grad
     assert not model.projector.shared_mask_set.requires_grad
+    assert model.decoder.training
 
     configure_stage(model, "stage1a", optimizer_step=2000)
     assert model.decoder.pre_decoder.weight.requires_grad
@@ -156,7 +187,49 @@ def test_stage1a_trainable_ownership_changes_at_boundaries():
     assert not model.projector.shared_mask_set.requires_grad
 
 
+def test_stage1b_trains_projector_and_temporal_interface_only():
+    model = _DummyModel()
+
+    configure_stage(model, "stage1b")
+
+    assert model.projector.main.weight.requires_grad
+    assert model.projector.shared_mask_set.requires_grad
+    assert not model.repa_projection.weight.requires_grad
+    assert model.decoder.training
+    assert model.decoder.temporal_adapter.weight.requires_grad
+    assert model.decoder.pre_decoder.weight.requires_grad
+    assert model.decoder.decoder.conv1.weight.requires_grad
+    assert model.decoder.decoder.time_conv.weight.requires_grad
+    assert not model.decoder.decoder.spatial.weight.requires_grad
+
+
+def test_stage1b_optimizer_uses_projector_and_temporal_interface_learning_rates():
+    model = _DummyModel()
+    configure_stage(model, "stage1b")
+    training = load_training_bundle("configs/train/stage1b.yaml")["training"]
+    training["fused_optimizer"] = False
+
+    generator, _ = build_optimizers(model, nn.Linear(1, 1), training)
+    groups = {group["name"]: group for group in generator.param_groups}
+    fast_ids = {id(parameter) for parameter in groups["rae_fast"]["params"]}
+    temporal_ids = {id(parameter) for parameter in groups["wan_temporal"]["params"]}
+
+    assert groups["rae_fast"]["lr"] == pytest.approx(1e-4)
+    assert groups["wan_temporal"]["lr"] == pytest.approx(2e-5)
+    assert id(model.projector.main.weight) in fast_ids
+    assert id(model.projector.shared_mask_set) in fast_ids
+    assert id(model.decoder.temporal_adapter.weight) in temporal_ids
+    assert id(model.decoder.pre_decoder.weight) in temporal_ids
+    assert id(model.decoder.decoder.conv1.weight) in temporal_ids
+    assert id(model.decoder.decoder.time_conv.weight) in temporal_ids
+    assert id(model.decoder.temporal_adapter.weight) not in fast_ids
+    assert all(not p.requires_grad for p in groups["wan_spatial"]["params"])
+
+
 def test_adversarial_factor_delays_and_ramps_linearly():
     assert adversarial_factor(4999, 5000, 2000) == 0.0
     assert adversarial_factor(6000, 5000, 2000) == pytest.approx(0.5)
     assert adversarial_factor(7000, 5000, 2000) == 1.0
+    assert adversarial_factor(0, 0, 1000) == 0.0
+    assert adversarial_factor(500, 0, 1000) == pytest.approx(0.5)
+    assert adversarial_factor(1000, 0, 1000) == 1.0

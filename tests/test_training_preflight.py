@@ -223,7 +223,7 @@ def test_checkpoint_transition_accepts_only_adjacent_completed_stage(target, sou
         "stage": source,
         "objective_mode": {
             "stage1a": "full_repa",
-            "stage1b": "full_repa_spatial_prefix",
+            "stage1b": "nested_spectral_hrepa_full_anchor",
             "stage2a": "full_repa",
         }[source],
         "optimizer_step": 10,
@@ -251,6 +251,27 @@ def test_checkpoint_transition_accepts_only_adjacent_completed_stage(target, sou
             )
 
 
+@pytest.mark.parametrize("legacy_objective", ["full_repa_spatial_prefix", "nested_spectral_prefix"])
+def test_stage2a_rejects_legacy_stage1b_objective(legacy_objective):
+    checkpoint = {
+        "checkpoint_schema_version": 4,
+        "stage": "stage1b",
+        "objective_mode": legacy_objective,
+        "optimizer_step": 90000,
+        "stage_max_steps": 90000,
+        "stage_complete": True,
+    }
+
+    with pytest.raises(RuntimeError, match="stage1b checkpoint objective mismatch"):
+        validate_checkpoint_transition(
+            checkpoint,
+            target_stage="stage2a",
+            target_objective_mode="full_repa",
+            mode="init",
+            allow_smoke_checkpoint=False,
+        )
+
+
 def test_incomplete_and_schema3_checkpoints_require_explicit_smoke_mode():
     incomplete = {
         "checkpoint_schema_version": 4,
@@ -264,14 +285,14 @@ def test_incomplete_and_schema3_checkpoints_require_explicit_smoke_mode():
         validate_checkpoint_transition(
             incomplete,
             target_stage="stage1b",
-            target_objective_mode="full_repa_spatial_prefix",
+            target_objective_mode="nested_spectral_hrepa_full_anchor",
             mode="init",
             allow_smoke_checkpoint=False,
         )
     validate_checkpoint_transition(
         incomplete,
         target_stage="stage1b",
-        target_objective_mode="full_repa_spatial_prefix",
+        target_objective_mode="nested_spectral_hrepa_full_anchor",
         mode="init",
         allow_smoke_checkpoint=True,
     )
@@ -285,14 +306,14 @@ def test_incomplete_and_schema3_checkpoints_require_explicit_smoke_mode():
         validate_checkpoint_transition(
             legacy,
             target_stage="stage1b",
-            target_objective_mode="full_repa_spatial_prefix",
+            target_objective_mode="nested_spectral_hrepa_full_anchor",
             mode="init",
             allow_smoke_checkpoint=False,
         )
     validate_checkpoint_transition(
         legacy,
         target_stage="stage1b",
-        target_objective_mode="full_repa_spatial_prefix",
+        target_objective_mode="nested_spectral_hrepa_full_anchor",
         mode="init",
         allow_smoke_checkpoint=True,
     )

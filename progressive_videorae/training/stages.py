@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
 import random
 
 import torch
@@ -14,7 +13,7 @@ from ..model.model import ProgressiveVideoRAE
 STAGES = ("stage1a", "stage1b", "stage2a", "stage2b")
 OBJECTIVE_MODES = {
     "stage1a": "full_repa",
-    "stage1b": "full_repa_spatial_prefix",
+    "stage1b": "nested_spectral_hrepa_full_anchor",
     "stage2a": "full_repa",
     "stage2b": "full_repa_stateful",
 }
@@ -25,15 +24,24 @@ STAGE_GEOMETRY = {
     "stage2b": (33, 9),
 }
 PREFIX_CONFIG_KEYS = {
+    "decoder_trainable_policy",
     "prefix_schedule",
     "prefix_min",
     "prefix_max",
     "prefix_objective_weight",
     "prefix_lpips_weight",
-    "full_microbatches_per_step",
+    "p47_full_microbatches_per_step",
+    "p47_objective_weight",
+    "prefix_repa_schedule",
+    "prefix_repa_levels",
+    "prefix_repa_global_weight",
+    "prefix_repa_local_weight",
 }
 
-STAGE1B_PREFIX_SCHEDULE = "fixed_4_full_3_single_1_pair"
+STAGE1B_PREFIX_SCHEDULE = "fixed_7_prefix_1_p47_full"
+STAGE1B_REPA_SCHEDULE = "fixed_6level_spatial_pyramid"
+STAGE1B_REPA_LEVELS = ((1, 1), (2, 3), (4, 6), (8, 12), (15, 24), (30, 48))
+STAGE1B_DECODER_POLICY = "temporal_interface"
 STAGE1A_PHASES = ("warmup", "interface", "full")
 
 
@@ -90,9 +98,46 @@ def validate_stage_objective(config: dict) -> str:
             raise ValueError(f"stage1b requires prefix_schedule={STAGE1B_PREFIX_SCHEDULE}")
         if int(config.get("gradient_accumulation_steps", 0)) != 8:
             raise ValueError("stage1b requires gradient_accumulation_steps=8")
-        if int(config.get("full_microbatches_per_step", 0)) != 4:
-            raise ValueError("stage1b requires full_microbatches_per_step=4")
+        if int(config.get("p47_full_microbatches_per_step", 0)) != 1:
+            raise ValueError("stage1b requires p47_full_microbatches_per_step=1")
+        if int(config.get("prefix_min", -1)) != 0 or int(config.get("prefix_max", -1)) != 46:
+            raise ValueError("stage1b random prefix endpoints must cover [0,46]")
+        if config.get("prefix_repa_schedule") != STAGE1B_REPA_SCHEDULE:
+            raise ValueError(
+                f"stage1b requires prefix_repa_schedule={STAGE1B_REPA_SCHEDULE}"
+            )
+        configured_levels = tuple(
+            tuple(int(size) for size in level)
+            for level in config.get("prefix_repa_levels", ())
+        )
+        if configured_levels != STAGE1B_REPA_LEVELS:
+            raise ValueError(
+                f"stage1b requires prefix_repa_levels={STAGE1B_REPA_LEVELS}"
+            )
+        for key in (
+            "prefix_objective_weight",
+            "p47_objective_weight",
+            "prefix_repa_global_weight",
+            "prefix_repa_local_weight",
+        ):
+            if float(config.get(key, -1.0)) != 1.0:
+                raise ValueError(f"stage1b requires {key}=1.0")
+        fixed_values = {
+            "repa_local_weight": 1.0,
+            "repa_global_weight": 1.0,
+            "adversarial_weight": 0.05,
+            "disc_start": 0,
+            "adversarial_ramp_steps": 1000,
+        }
+        for key, value in fixed_values.items():
+            if float(config.get(key, -1.0)) != value:
+                raise ValueError(f"stage1b requires {key}={value}")
+        if config.get("decoder_trainable_policy") != STAGE1B_DECODER_POLICY:
+            raise ValueError(
+                f"stage1b requires decoder_trainable_policy={STAGE1B_DECODER_POLICY}"
+            )
     return expected
+
 
 def validate_training_bundle(
     training: dict,
@@ -205,6 +250,21 @@ def _set_trainable(module: nn.Module, trainable: bool) -> None:
     module.train(trainable)
 
 
+def _configure_temporal_interface(decoder: nn.Module, *, pre_decoder: bool) -> None:
+    """Freeze Wan weights selectively while keeping its checkpoint path in train mode."""
+
+    decoder.requires_grad_(False)
+    decoder.train(True)
+    _set_trainable(decoder.temporal_adapter, True)
+    if not pre_decoder:
+        return
+    _set_trainable(decoder.pre_decoder, True)
+    _set_trainable(decoder.decoder.conv1, True)
+    for name, module in decoder.decoder.named_modules():
+        if name.endswith("time_conv"):
+            _set_trainable(module, True)
+
+
 def configure_stage(
     model: ProgressiveVideoRAE,
     stage: str,
@@ -216,15 +276,20 @@ def configure_stage(
     if stage not in STAGES:
         raise ValueError(f"Unsupported stage {stage}; expected one of {STAGES}")
     _set_trainable(model.encoder, False)
-    if stage in ("stage1a", "stage1b"):
+    if stage == "stage1a":
         _set_trainable(model.projector, True)
         _set_trainable(model.repa_projection, True)
-        if stage == "stage1a":
-            model.projector.shared_mask_set.requires_grad_(False)
+        model.projector.shared_mask_set.requires_grad_(False)
+    elif stage == "stage1b":
+        _set_trainable(model.projector, True)
+        _set_trainable(model.repa_projection, False)
     else:
         _set_trainable(model.projector, False)
         _set_trainable(model.repa_projection, False)
 
+    if stage == "stage1b":
+        _configure_temporal_interface(model.decoder, pre_decoder=True)
+        return
     if stage != "stage1a":
         _set_trainable(model.decoder, True)
         return
@@ -234,23 +299,11 @@ def configure_stage(
         wan_interface_step=wan_interface_step,
         wan_full_step=wan_full_step,
     )
-    _set_trainable(model.decoder, False)
-    _set_trainable(model.decoder.temporal_adapter, True)
-    if phase in ("interface", "full"):
-        _set_trainable(model.decoder.pre_decoder, True)
-        _set_trainable(model.decoder.decoder.conv1, True)
-        for name, module in model.decoder.decoder.named_modules():
-            if name.endswith("time_conv"):
-                _set_trainable(module, True)
+    _configure_temporal_interface(
+        model.decoder, pre_decoder=phase in ("interface", "full")
+    )
     if phase == "full":
         _set_trainable(model.decoder, True)
-
-
-def _cosine_endpoint(minimum: int, maximum: int) -> int:
-    endpoints = list(range(minimum, maximum + 1))
-    denominator = max(1, maximum - minimum)
-    weights = [1.5 + 0.5 * math.cos(math.pi * (s - minimum) / denominator) for s in endpoints]
-    return random.choices(endpoints, weights=weights, k=1)[0]
 
 
 def sample_microbatch_tasks(
@@ -265,13 +318,10 @@ def sample_microbatch_tasks(
         raise ValueError(f"Unsupported stage: {stage}")
     if accumulation_steps != 8:
         raise ValueError("Stage 1B requires exactly 8 microbatches per optimizer step")
-    tasks = [MicrobatchTask("full") for _ in range(4)]
-    tasks.extend(
-        MicrobatchTask("single_prefix", _cosine_endpoint(0, 46))
-        for _ in range(3)
-    )
-    endpoint = _cosine_endpoint(1, 47)
-    tasks.append(MicrobatchTask("paired_prefix", endpoint, endpoint - 1))
+    tasks = [
+        MicrobatchTask("single_prefix", random.randint(0, 46)) for _ in range(7)
+    ]
+    tasks.append(MicrobatchTask("full"))
     random.shuffle(tasks)
     return tuple(tasks)
 

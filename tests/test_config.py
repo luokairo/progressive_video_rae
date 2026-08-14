@@ -17,8 +17,18 @@ def test_model_and_training_configs_resolve_from_project_root():
     assert bundle["model"]["state"]["num_sets"] == 48
     assert bundle["model"]["state"]["tokens_per_set"] == 30
     assert bundle["data"]["target_fps"] == 12.0
-    assert bundle["training"]["prefix_schedule"] == "fixed_4_full_3_single_1_pair"
-    assert bundle["training"]["full_microbatches_per_step"] == 4
+    assert bundle["training"]["objective_mode"] == "nested_spectral_hrepa_full_anchor"
+    assert bundle["training"]["prefix_schedule"] == "fixed_7_prefix_1_p47_full"
+    assert bundle["training"]["p47_full_microbatches_per_step"] == 1
+    assert bundle["training"]["prefix_repa_schedule"] == "fixed_6level_spatial_pyramid"
+    assert bundle["training"]["prefix_repa_levels"] == [
+        [1, 1], [2, 3], [4, 6], [8, 12], [15, 24], [30, 48]
+    ]
+    assert bundle["training"]["prefix_repa_global_weight"] == 1.0
+    assert bundle["training"]["prefix_repa_local_weight"] == 1.0
+    assert bundle["training"]["adversarial_weight"] == 0.05
+    assert bundle["training"]["adversarial_ramp_steps"] == 1000
+    assert bundle["training"]["decoder_trainable_policy"] == "temporal_interface"
     assert bundle["training"]["gradient_accumulation_steps"] == 8
     assert bundle["training"]["global_batch_size"] == 64
     assert bundle["training"]["prefix_objective_weight"] == 1.0
@@ -30,6 +40,7 @@ def test_model_and_training_configs_resolve_from_project_root():
         "full": True,
     }
     assert stage1a["fused_optimizer"] is True
+    assert bundle["training"]["fused_optimizer"] is True
     assert stage1a["save_at_steps"] == [100, 500]
     stage2a = load_training_bundle("configs/train/stage2a.yaml")["training"]
     stage2b_bundle = load_training_bundle("configs/train/stage2b.yaml")

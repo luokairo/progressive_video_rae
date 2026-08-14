@@ -20,7 +20,7 @@ UPSTREAM_COMMITS = {
 PREVIOUS_STAGE = {"stage1b": "stage1a", "stage2a": "stage1b", "stage2b": "stage2a"}
 OBJECTIVE_BY_STAGE = {
     "stage1a": "full_repa",
-    "stage1b": "full_repa_spatial_prefix",
+    "stage1b": "nested_spectral_hrepa_full_anchor",
     "stage2a": "full_repa",
     "stage2b": "full_repa_stateful",
 }
@@ -162,6 +162,7 @@ def validate_checkpoint_transition(
     target_objective_mode: str,
     mode: Literal["init", "resume"],
     allow_smoke_checkpoint: bool,
+    selected_intermediate: bool = False,
 ) -> None:
     schema = int(checkpoint.get("checkpoint_schema_version", 0))
     if schema != CHECKPOINT_SCHEMA_VERSION:
@@ -198,7 +199,7 @@ def validate_checkpoint_transition(
     if saved_objective != expected_objective:
         raise RuntimeError(f"{expected_source} checkpoint objective mismatch")
     if schema == CHECKPOINT_SCHEMA_VERSION and not bool(checkpoint.get("stage_complete")):
-        if not allow_smoke_checkpoint:
+        if not allow_smoke_checkpoint and not selected_intermediate:
             raise RuntimeError(
                 f"{target_stage} requires a completed {expected_source} checkpoint"
             )
@@ -334,8 +335,15 @@ def load_checkpoint(
     target_objective_mode: str | None = None,
     load_mode: Literal["init", "resume"] | None = None,
     allow_smoke_checkpoint: bool = False,
+    selection_certificate: str | Path | None = None,
+    mmap: bool = False,
 ) -> dict[str, Any]:
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint = torch.load(
+        str(Path(path).expanduser().resolve()),
+        map_location="cpu",
+        mmap=mmap,
+        weights_only=False,
+    )
     schema = int(checkpoint.get("checkpoint_schema_version", 0))
     if schema != CHECKPOINT_SCHEMA_VERSION and not (
         allow_smoke_checkpoint and schema == 3
@@ -344,6 +352,24 @@ def load_checkpoint(
             f"Checkpoint schema v{schema} cannot be loaded; expected v4"
         )
     transition_values = (target_stage, target_objective_mode, load_mode)
+    selected_intermediate = False
+    if selection_certificate is not None:
+        if load_mode != "init" or target_stage is None:
+            raise ValueError("A selection certificate is only valid for --init-from")
+        previous_stage = PREVIOUS_STAGE.get(str(target_stage))
+        if previous_stage is None:
+            raise ValueError("Stage 1-A cannot use a selection certificate")
+        from .selection_certificate import validate_selection_certificate
+
+        validate_selection_certificate(
+            selection_certificate,
+            source_checkpoint=path,
+            target_stage=str(target_stage),
+            previous_stage=previous_stage,
+            previous_objective=OBJECTIVE_BY_STAGE[previous_stage],
+            checkpoint_schema_version=CHECKPOINT_SCHEMA_VERSION,
+        )
+        selected_intermediate = True
     if any(value is not None for value in transition_values):
         if not all(value is not None for value in transition_values):
             raise ValueError(
@@ -355,6 +381,7 @@ def load_checkpoint(
             target_objective_mode=str(target_objective_mode),
             mode=load_mode,
             allow_smoke_checkpoint=allow_smoke_checkpoint,
+            selected_intermediate=selected_intermediate,
         )
 
     expected_contract = unwrap(model).state_contract.to_dict()

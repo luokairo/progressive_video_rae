@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import csv
 import json
 from pathlib import Path
@@ -13,12 +14,11 @@ from torch.utils.data import DataLoader
 from ..checksums import sha256_file, sha256_sidecar_path, verify_checkpoint_sha256
 from ..config import load_yaml, project_root, resolve_config_path
 from ..model.factory import build_model
-from ..training.checkpoint import (
-    load_checkpoint,
-    representation_identity,
-    verify_pretrained_checkpoint_hashes,
-)
+from ..model.types import ProgressiveState
+from .benchmarks import load_benchmark_records, manifest_rows_digest
+from .checkpoint_metadata import load_stage_checkpoint_metadata
 from .full import (
+    consume_reserve_replacement,
     FVD_FEATURE_DIM,
     ExactEvaluationDataset,
     SUMMARY_METRICS,
@@ -31,6 +31,7 @@ from .full import (
     read_jsonl_repair,
     run_identity,
     sample_id_digest,
+    require_exact_sample_count,
     slice_progressive_state,
     summarize_rows,
     utc_now,
@@ -71,17 +72,30 @@ def _require_file_and_sidecar(path: str | Path, label: str) -> Path:
     return resolved
 
 
-def _preflight_model_paths(model_config: dict[str, Any]) -> None:
-    _require_file_and_sidecar(
+def _preflight_model_paths(model_config: dict[str, Any]) -> dict[str, str]:
+    encoder_checkpoint = _require_file_and_sidecar(
         model_config["encoder"]["checkpoint_path"], "Encoder checkpoint"
     )
-    _require_file_and_sidecar(
+    decoder_checkpoint = _require_file_and_sidecar(
         model_config["decoder"]["checkpoint_path"], "Wan checkpoint"
     )
+    return {
+        "encoder": verify_checkpoint_sha256(encoder_checkpoint, create_missing_sidecar=False),
+        "decoder": verify_checkpoint_sha256(decoder_checkpoint, create_missing_sidecar=False),
+    }
 
 
 def _autocast_context(precision: torch.dtype):
     return torch.autocast("cuda", dtype=precision, enabled=True)
+
+
+def _require_full_projected_state(projected: Any) -> ProgressiveState:
+    state = projected.state
+    if not isinstance(state, ProgressiveState):
+        raise TypeError("Projector must produce a ProgressiveState")
+    if state.full_endpoint != 47 or state.tokens.shape[2] != 48:
+        raise RuntimeError("Projector did not produce the complete P_47 state")
+    return state
 
 
 def _cache_equivalence(
@@ -102,9 +116,12 @@ def _cache_equivalence(
         for chunk_index, size in enumerate(pattern):
             chunk = slice_progressive_state(state, start, start + size)
             device_type = state.tokens.device.type
-            with torch.inference_mode(), torch.autocast(
-                device_type, dtype=precision, enabled=device_type == "cuda"
-            ):
+            autocast = (
+                torch.autocast("cuda", dtype=precision)
+                if device_type == "cuda"
+                else nullcontext()
+            )
+            with torch.inference_mode(), autocast:
                 output = decoder.decode(
                     chunk,
                     cache_mode="reset" if chunk_index == 0 else "reuse",
@@ -235,6 +252,7 @@ def _finalize(
         output_dir,
         manifest,
         status="completed",
+        fvd_feature_sample_count=len(rows) if fvd_features is not None else None,
         completed_at=utc_now(),
         completed_samples=len(rows),
         sample_id_digest=final_digest,
@@ -268,25 +286,135 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         data_config,
         require_runtime_device=True,
     )
+    benchmark = evaluation.get("benchmark")
+    benchmark_mode = benchmark is not None
+    selection_mode = evaluation["purpose"] in {
+        "checkpoint_selection",
+        "checkpoint_selection_smoke",
+    }
+    expected_stage = getattr(args, "expected_stage", None)
+    benchmark_manifest = getattr(args, "benchmark_manifest", None)
+    selection_manifest = getattr(args, "selection_manifest", None)
+    if benchmark_mode:
+        if not expected_stage:
+            raise ValueError("Benchmark evaluation requires --expected-stage")
+        if not benchmark_manifest:
+            raise ValueError("Benchmark evaluation requires --benchmark-manifest")
+        if bool(args.allow_smoke_checkpoint):
+            raise ValueError("Formal benchmark evaluation forbids smoke checkpoints")
+        if selection_manifest:
+            raise ValueError("Benchmark evaluation cannot use --selection-manifest")
+    elif selection_mode:
+        if not expected_stage or not selection_manifest:
+            raise ValueError(
+                "Checkpoint selection requires --expected-stage and --selection-manifest"
+            )
+        if benchmark_manifest:
+            raise ValueError("Checkpoint selection cannot use --benchmark-manifest")
+        if bool(args.allow_smoke_checkpoint):
+            raise ValueError("Checkpoint selection forbids smoke checkpoints")
+    elif expected_stage or benchmark_manifest or selection_manifest:
+        raise ValueError(
+            "Stage and external manifest arguments require benchmark or selection configs"
+        )
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Training checkpoint is unavailable: {checkpoint_path}")
-    _preflight_model_paths(model_config)
-    manifest_path = (
-        Path(data_config["manifest_dir"]).expanduser().resolve()
-        / f"{evaluation['split']}.parquet"
-    )
+    if benchmark_mode:
+        manifest_path = Path(benchmark_manifest).expanduser().resolve()
+    elif selection_mode:
+        manifest_path = Path(selection_manifest).expanduser().resolve()
+    else:
+        manifest_path = (
+            Path(data_config["manifest_dir"]).expanduser().resolve()
+            / f"{evaluation['split']}.parquet"
+        )
     if not manifest_path.is_file():
         raise FileNotFoundError(f"Evaluation manifest is unavailable: {manifest_path}")
 
     checkpoint_sha = sha256_file(checkpoint_path)
     manifest_sha = sha256_file(manifest_path)
+    checkpoint_metadata = None
+    selection_report = None
+    if benchmark_mode:
+        checkpoint_metadata = load_stage_checkpoint_metadata(
+            checkpoint_path,
+            expected_stage=str(expected_stage),
+            evaluation_frames=int(data_config["num_frames"]),
+            evaluation_latents=int(model_config["state"]["num_frames"]),
+        )
+    elif selection_mode:
+        from .selection import (
+            load_selection_candidate_metadata,
+            load_selection_manifest,
+        )
+
+        resolved_path = checkpoint_path.parent / "resolved_config.json"
+        if not resolved_path.is_file():
+            raise FileNotFoundError(f"Missing checkpoint resolved config: {resolved_path}")
+        resolved_checkpoint_config = json.loads(resolved_path.read_text(encoding="utf-8"))
+        try:
+            checkpoint_step = int(checkpoint_path.stem.removeprefix("step_"))
+        except ValueError as exc:
+            raise ValueError("Selection checkpoint must be named step_XXXXXXXX.pt") from exc
+        checkpoint_metadata = load_selection_candidate_metadata(
+            checkpoint_path,
+            resolved_config=resolved_checkpoint_config,
+            stage=str(expected_stage),
+            expected_step=checkpoint_step,
+        )
     i3d_sha = (
         verify_checkpoint_sha256(
             evaluation["i3d_checkpoint"], create_missing_sidecar=False
         )
         if evaluation["compute_fvd"]
         else None
+    )
+    pretrained_checkpoint_sha256 = _preflight_model_paths(model_config)
+    if benchmark_mode:
+        records = load_benchmark_records(manifest_path, benchmark)
+    elif selection_mode:
+        from .selection import (
+            SELECTION_PROTOCOL,
+            SELECTION_SMOKE_PROTOCOL,
+        )
+
+        records, selection_report = load_selection_manifest(
+            manifest_path,
+            expected_count=int(evaluation["max_clips"]),
+            expected_protocol=(
+                SELECTION_SMOKE_PROTOCOL
+                if evaluation["purpose"] == "checkpoint_selection_smoke"
+                else SELECTION_PROTOCOL
+            ),
+        )
+    else:
+        records = load_ranked_records(
+            manifest_path,
+            num_frames=int(data_config["num_frames"]),
+            target_fps=float(data_config["target_fps"]),
+            sampling_seed=int(evaluation["sampling_seed"]),
+        )
+    if len(records) < evaluation["max_clips"]:
+        raise RuntimeError(f"Only {len(records)} valid manifest rows are available")
+    sampling = (
+        {
+            "mode": "exhaustive",
+            "candidate_count": len(records),
+            "initial_selection_count": len(records),
+            "initial_sample_id_digest": sample_id_digest(
+                str(row["sample_id"]) for row in records
+            ),
+        }
+        if benchmark_mode or selection_mode
+        else {
+            "seed": evaluation["sampling_seed"],
+            "ranked_candidate_count": len(records),
+            "initial_selection_count": evaluation["max_clips"],
+            "initial_sample_id_digest": sample_id_digest(
+                str(row["sample_id"]) for row in records[: evaluation["max_clips"]]
+            ),
+        }
     )
     identity = run_identity(
         evaluation=evaluation,
@@ -297,17 +425,51 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         manifest_path=str(manifest_path),
         manifest_sha256=manifest_sha,
         i3d_sha256=i3d_sha,
+        pretrained_checkpoint_sha256=pretrained_checkpoint_sha256,
+        sampling=sampling,
         project_root=project_root(),
     )
     identity["allow_smoke_checkpoint"] = bool(args.allow_smoke_checkpoint)
+    if benchmark_mode:
+        official_hashes = {str(row["official_list_sha256"]) for row in records}
+        identity["benchmark"] = {
+            "name": benchmark["name"],
+            "protocol_id": benchmark["protocol_id"],
+            "official_list_sha256": next(iter(official_hashes)),
+            "manifest_sha256": manifest_sha,
+            "manifest_rows_digest": manifest_rows_digest(records),
+            "sample_count": len(records),
+            "stage": checkpoint_metadata["stage"],
+            "objective": checkpoint_metadata["objective"],
+            "optimizer_step": checkpoint_metadata["optimizer_step"],
+            "training_geometry": checkpoint_metadata["training_geometry"],
+            "evaluation_geometry": checkpoint_metadata["evaluation_geometry"],
+            "sample_id_digest": sampling["initial_sample_id_digest"],
+            "exhaustive": True,
+        }
+    if selection_mode:
+        identity["checkpoint_selection"] = {
+            "protocol": selection_report["protocol"],
+            "selection_manifest_sha256": selection_report["selection_manifest_sha256"],
+            "sample_id_digest": selection_report["sample_id_digest"],
+            "sample_count": selection_report["selection_count"],
+            "stage": checkpoint_metadata["stage"],
+            "objective": checkpoint_metadata["objective"],
+            "optimizer_step": checkpoint_metadata["optimizer_step"],
+            "stage_complete": checkpoint_metadata["stage_complete"],
+            "evaluation_geometry": {
+                "rgb_frames": int(data_config["num_frames"]),
+                "temporal_latents": int(model_config["state"]["num_frames"]),
+            },
+            "full_endpoint": 47,
+            "exhaustive": True,
+        }
     output_dir = Path(args.output_dir).expanduser().resolve()
     manifest = prepare_run_manifest(output_dir, identity, resume=args.resume)
 
     try:
         device = torch.device("cuda")
-        precision = (
-            torch.bfloat16 if evaluation["precision"] == "bf16" else torch.float16
-        )
+        precision = torch.bfloat16
         i3d = None
         if evaluation["compute_fvd"]:
             i3d = I3DFeatureExtractor(evaluation["i3d_checkpoint"]).to(device).eval()
@@ -325,6 +487,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             if tuple(contract_features.shape) != (1, FVD_FEATURE_DIM):
                 raise RuntimeError("I3D contract preflight failed")
 
+        from ..training.checkpoint import (
+            load_checkpoint,
+            representation_identity,
+            verify_pretrained_checkpoint_hashes,
+        )
+
         model = build_model(model_config).to(device).eval()
         checkpoint_hashes = verify_pretrained_checkpoint_hashes(
             model, create_missing_sidecars=False
@@ -338,25 +506,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             restore_rng=False,
             static_identity=static_identity,
             allow_smoke_checkpoint=args.allow_smoke_checkpoint,
+            mmap=True,
         )
         model.decoder.enable_gradient_checkpointing(False)
-        manifest["representation_identity"] = loaded_checkpoint[
-            "representation_identity"
-        ]
+        loaded_representation = loaded_checkpoint["representation_identity"]
+        existing_representation = manifest.get("representation_identity")
+        if (
+            existing_representation is not None
+            and existing_representation != loaded_representation
+        ):
+            raise RuntimeError("Resume representation identity does not match checkpoint")
+        manifest["representation_identity"] = loaded_representation
         update_run_manifest(output_dir, manifest)
 
-        records = load_ranked_records(
-            manifest_path,
-            num_frames=int(data_config["num_frames"]),
-            target_fps=float(data_config["target_fps"]),
-            sampling_seed=int(evaluation["sampling_seed"]),
-        )
         dataset = ExactEvaluationDataset(
             records,
             num_frames=int(data_config["num_frames"]),
             target_fps=float(data_config["target_fps"]),
             height=int(data_config["height"]),
             width=int(data_config["width"]),
+            benchmark_mode=benchmark_mode,
         )
         loader = DataLoader(
             dataset,
@@ -370,6 +539,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         metric_suite = FullReconstructionMetricSuite().to(device).eval()
 
         sample_records, failures = _load_progress(output_dir)
+        strict_manifest_mode = benchmark_mode or selection_mode
+        if strict_manifest_mode and failures:
+            raise RuntimeError(
+                "An exhaustive run with recorded decode failures cannot resume"
+            )
         completed_ids = {
             str(record["row"]["sample_id"]) for record in sample_records
         }
@@ -429,6 +603,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     completed_samples=len(sample_records),
                     decode_failures=len(failures),
                 )
+                if strict_manifest_mode:
+                    raise RuntimeError(
+                        f"Frozen exhaustive sample {sample_id} failed to decode: "
+                        f"{sample['decode_error']}"
+                    )
                 continue
 
             pixel_values = sample["pixel_values"].to(device, non_blocking=True)
@@ -436,7 +615,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
             def encode_call():
                 with torch.inference_mode(), _autocast_context(precision):
-                    return model.encoder.encode_prefixes(pixel_values)
+                    return model.encode_features(pixel_values)
 
             encoder_output, encoder_measurement = measure_cuda_phase(encode_call)
 
@@ -445,7 +624,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     return model.projector(encoder_output)
 
             projected, projector_measurement = measure_cuda_phase(project_call)
-            state = projected.state
+            state = _require_full_projected_state(projected)
 
             def decode_call():
                 with torch.inference_mode(), _autocast_context(precision):
@@ -461,10 +640,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "codec_sequence_id": str(sample["codec_sequence_id"]),
                 "candidate_index": candidate_index,
                 "replacement_for": (
-                    unresolved_initial_failures.pop(0)
-                    if candidate_index >= evaluation["max_clips"]
-                    and unresolved_initial_failures
-                    else None
+                    None
+                    if strict_manifest_mode
+                    else consume_reserve_replacement(
+                        candidate_index,
+                        evaluation["max_clips"],
+                        unresolved_initial_failures,
+                    )
                 ),
                 "native_fps": float(sample["native_fps"]),
                 "encoder_seconds": encoder_measurement.seconds,
@@ -475,27 +657,29 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     + projector_measurement.seconds
                     + decoder_measurement.seconds
                 ),
+                "encoder_start_allocated_gb": encoder_measurement.start_allocated_gb,
                 "encoder_peak_allocated_gb": encoder_measurement.peak_allocated_gb,
                 "encoder_incremental_peak_gb": encoder_measurement.incremental_peak_gb,
+                "projector_start_allocated_gb": projector_measurement.start_allocated_gb,
                 "projector_peak_allocated_gb": projector_measurement.peak_allocated_gb,
                 "projector_incremental_peak_gb": (
                     projector_measurement.incremental_peak_gb
                 ),
+                "decoder_start_allocated_gb": decoder_measurement.start_allocated_gb,
                 "decoder_peak_allocated_gb": decoder_measurement.peak_allocated_gb,
                 "decoder_incremental_peak_gb": decoder_measurement.incremental_peak_gb,
                 **metric_suite(prediction_raw, target_rgb),
             }
 
             clamped = prediction_raw.clamp(-1.0, 1.0)
-            with torch.inference_mode(), _autocast_context(precision):
-                reconstructed_features = model.encoder.encode_prefixes(
-                    clamped.add(1).mul(0.5)
+            if evaluation["compute_vjepa"]:
+                with torch.inference_mode(), _autocast_context(precision):
+                    reconstructed_features = model.encode_features(clamped.add(1).mul(0.5))
+                local, global_score = encoder_cosine(
+                    encoder_output, reconstructed_features
                 )
-            local, global_score = encoder_cosine(
-                encoder_output, reconstructed_features
-            )
-            row["vjepa_local_cosine"] = float(local.cpu())
-            row["vjepa_global_cosine"] = float(global_score.cpu())
+                row["vjepa_local_cosine"] = float(local.cpu())
+                row["vjepa_global_cosine"] = float(global_score.cpu())
 
             state_rows = []
             if evaluation["compute_state_statistics"]:
@@ -586,6 +770,13 @@ def main() -> None:
     )
     parser.add_argument("--config", required=True)
     parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--benchmark-manifest", default=None)
+    parser.add_argument("--selection-manifest", default=None)
+    parser.add_argument(
+        "--expected-stage",
+        choices=("stage1a", "stage1b", "stage2a", "stage2b"),
+        default=None,
+    )
     parser.add_argument("--model-config", default=None)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--allow-smoke-checkpoint", action="store_true")

@@ -233,7 +233,9 @@ class ProgressiveVideoRAE(nn.Module):
     ) -> ProgressiveVideoRAEOutput:
         state = projected.state
         state_view: ProgressiveState | SpatialPrefixView = (
-            state if endpoint is None else self.projector.make_prefix_view(state, endpoint)
+            state
+            if endpoint is None or endpoint == state.full_endpoint
+            else self.projector.make_prefix_view(state, endpoint)
         )
         return self._decode_state_view(
             pixel_values,

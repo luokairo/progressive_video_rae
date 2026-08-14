@@ -20,7 +20,6 @@ from torch.utils.data import DataLoader
 
 from .config import load_training_bundle
 from .data import DistributedFullDatasetSampler, VideoManifestDataset, collate_video_samples
-from .model.dct import dct_lowpass_target
 from .model.factory import build_model
 from .training.checkpoint import (
     load_checkpoint,
@@ -312,14 +311,17 @@ def _unique(parameters):
 
 def build_optimizers(model, discriminator, config: dict[str, Any]):
     module = unwrap(model)
-    fast = _unique(
-        list(module.projector.parameters())
-        + list(module.repa_projection.parameters())
-        + list(module.decoder.temporal_adapter.parameters())
+    fast_parameters = list(module.projector.parameters()) + list(
+        module.repa_projection.parameters()
     )
     interface = list(module.decoder.pre_decoder.parameters()) + list(
         module.decoder.decoder.conv1.parameters()
     )
+    if config.get("stage") == "stage1b":
+        interface = list(module.decoder.temporal_adapter.parameters()) + interface
+    else:
+        fast_parameters += list(module.decoder.temporal_adapter.parameters())
+    fast = _unique(fast_parameters)
     for name, child in module.decoder.decoder.named_modules():
         if name.endswith("time_conv"):
             interface.extend(child.parameters())
@@ -411,24 +413,44 @@ def _sequence_id(batch: dict[str, Any]) -> str:
 def _prefix_loss(losses, output, pixel_values, endpoint, previous_prediction=None):
     full_target = pixel_values.mul(2.0).sub(1.0)
     with torch.autocast("cuda", enabled=False):
-        lowpass = dct_lowpass_target(full_target.float(), endpoint)
         return losses.prefix(
             output,
-            lowpass,
+            full_target,
             endpoint=endpoint,
-            full_target=full_target,
             previous_prediction=previous_prediction,
         )
 
-PREFIX_WINDOW_TERMS = ("l1", "band", "leakage", "paired_delta")
+PREFIX_WINDOW_TERMS = (
+    "l1",
+    "band",
+    "leakage",
+    "paired_delta",
+    "prefix_repa_global",
+    "prefix_repa_local",
+    "prefix_repa_local_scaled",
+)
+
+PREFIX_WINDOW_STATISTICS = (
+    "prefix_repa/level",
+    "prefix_repa/grid_height",
+    "prefix_repa/grid_width",
+    "prefix_repa/local_scale",
+    "prefix_repa/anchor_global_error",
+    "prefix_repa/anchor_local_error",
+) + tuple(
+    f"prefix_repa/group_{group_index:02d}/{phase_name}_{scope}_error"
+    for group_index in range(4)
+    for phase_name in ("f0", "f1")
+    for scope in ("global", "local")
+)
 
 
 def _prefix_window_metric_names() -> tuple[str, ...]:
     return tuple(
-        f"prefix/{kind}/endpoint_{endpoint:02d}/{term}"
+        f"prefix/{kind}/endpoint_{endpoint:02d}/{metric}"
         for kind in ("single", "paired")
         for endpoint in range(48)
-        for term in PREFIX_WINDOW_TERMS
+        for metric in PREFIX_WINDOW_TERMS + PREFIX_WINDOW_STATISTICS
     )
 
 
@@ -439,6 +461,12 @@ def record_prefix_window(window, *, kind: str, endpoint: int, loss) -> None:
             f"prefix/{kind}/endpoint_{endpoint:02d}/{term}",
             loss.terms[term],
         )
+    for name in PREFIX_WINDOW_STATISTICS:
+        if name in loss.statistics:
+            window.add_mean(
+                f"prefix/{kind}/endpoint_{endpoint:02d}/{name}",
+                loss.statistics[name],
+            )
 
 
 def forward_training_batch(
@@ -456,7 +484,9 @@ def forward_training_batch(
         "endpoint": endpoint,
         "paired_previous_endpoint": task.previous_endpoint,
         "cache_mode": "reset" if stage == "stage2b" else "disabled",
-        "return_decoder_features": task.is_full,
+        "return_decoder_features": (
+            task.is_full or (stage == "stage1b" and task.kind == "single_prefix")
+        ),
         "sequence_id": sequence_id,
     }
     return model(pixel_values, **kwargs)
@@ -481,7 +511,25 @@ def validate_resume_training_contract(
     if training.get("stage") == "stage1b":
         keys += (
             "prefix_schedule",
-            "full_microbatches_per_step",
+            "p47_full_microbatches_per_step",
+            "prefix_min",
+            "prefix_max",
+            "prefix_objective_weight",
+            "p47_objective_weight",
+            "prefix_lpips_weight",
+            "prefix_repa_schedule",
+            "prefix_repa_levels",
+            "prefix_repa_global_weight",
+            "prefix_repa_local_weight",
+            "repa_local_weight",
+            "repa_global_weight",
+            "band_weight",
+            "leakage_weight",
+            "adversarial_weight",
+            "disc_start",
+            "adversarial_ramp_steps",
+            "decoder_trainable_policy",
+            "fused_optimizer",
         )
     mismatches = {
         key: (saved.get(key), training.get(key))
@@ -498,12 +546,17 @@ def main() -> None:
     parser.add_argument("--model-config", default=None)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--init-from", default=None)
+    parser.add_argument("--selection-certificate", default=None)
     parser.add_argument("--allow-smoke-checkpoint", action="store_true")
     parser.add_argument("--set", action="append", default=[])
     parser.add_argument("--seed", type=int, default=20260807)
     args = parser.parse_args()
     if args.resume is not None and args.init_from is not None:
         parser.error("--resume and --init-from are mutually exclusive")
+    if args.selection_certificate is not None and args.init_from is None:
+        parser.error("--selection-certificate requires --init-from")
+    if args.selection_certificate is not None and args.allow_smoke_checkpoint:
+        parser.error("--selection-certificate is only valid for formal training")
     if not torch.cuda.is_available():
         raise RuntimeError("Training requires CUDA")
 
@@ -596,6 +649,14 @@ def main() -> None:
             run_paths.checkpoint_root
         ):
             raise ValueError("Formal init-from checkpoint must be under checkpoint_root")
+        if args.selection_certificate is not None:
+            certificate_path = validate_external_absolute_path(
+                args.selection_certificate, label="selection certificate"
+            )
+            if not certificate_path.is_relative_to(run_paths.checkpoint_root):
+                raise ValueError(
+                    "Formal selection certificate must be under checkpoint_root"
+                )
     if not args.resume and tuple(checkpoint_dir.glob("step_*.pt")):
         raise FileExistsError(f"Refusing to overwrite existing run: {checkpoint_dir}")
     if rank == 0:
@@ -635,6 +696,10 @@ def main() -> None:
         lpips_weight=training.get("lpips_weight", 1.0),
         repa_local_weight=training.get("repa_local_weight", 1.0),
         repa_global_weight=training.get("repa_global_weight", 1.0),
+        prefix_repa_local_weight=training.get("prefix_repa_local_weight", 0.0),
+        prefix_repa_global_weight=training.get(
+            "prefix_repa_global_weight", 0.0
+        ),
         adversarial_weight=training.get("adversarial_weight", 0.1),
         temporal_l1_weight=training.get("temporal_l1_weight", 0.1),
         band_weight=training.get("band_weight", 1.0),
@@ -665,6 +730,7 @@ def main() -> None:
             target_objective_mode=objective_mode,
             load_mode="init",
             allow_smoke_checkpoint=args.allow_smoke_checkpoint,
+            selection_certificate=args.selection_certificate,
         )
     if args.resume:
         checkpoint = load_checkpoint(
@@ -715,6 +781,11 @@ def main() -> None:
         "checkpoint_dir": str(checkpoint_dir),
         "log_file": str(log_file),
         "source_checkpoint": source_checkpoint,
+        "source_selection_certificate": (
+            str(Path(args.selection_certificate).expanduser().resolve())
+            if args.selection_certificate is not None
+            else None
+        ),
     }
     bundle = resolved_bundle
     if rank == 0:
@@ -738,6 +809,7 @@ def main() -> None:
     autocast_dtype = torch.bfloat16 if training["precision"] == "bf16" else torch.float16
     accumulation = int(training["gradient_accumulation_steps"])
     prefix_objective_weight = float(training.get("prefix_objective_weight", 1.0))
+    p47_objective_weight = float(training.get("p47_objective_weight", 1.0))
     prefix_window = GlobalMetricWindow(
         _prefix_window_metric_names(), device=device, prefix_bins=48
     )
@@ -775,6 +847,12 @@ def main() -> None:
             int(training.get("disc_start", 0)),
             int(training.get("adversarial_ramp_steps", 0)),
         )
+        gan_active = (
+            full_count > 0
+            and gan_factor > 0.0
+            and losses.adversarial_weight > 0.0
+        )
+        discriminator_forwards = 0
 
         data_seconds = 0.0
 
@@ -807,21 +885,35 @@ def main() -> None:
                     assert not isinstance(result, tuple)
                     if result.repa_reference is None or result.repa_features is None:
                         raise RuntimeError(f"{stage} full objective requires REPA")
-                    if gan_factor > 0.0 and losses.adversarial_weight > 0.0:
+                    if gan_active:
                         disc_loss = losses.discriminator(
-                            discriminator, result.reconstruction, result.target
+                            discriminator,
+                            result.reconstruction,
+                            result.target,
+                            adversarial_factor=gan_factor,
                         )
                         assert_finite_distributed(disc_loss.total, "discriminator")
-                        (disc_loss.total / max(1, full_count)).backward()
+                        (disc_loss.total / full_count).backward()
+                        discriminator_forwards += 2
                         for name, value in disc_loss.terms.items():
                             metrics[name] = metrics.get(name, 0.0) + (
-                                float(value.detach()) / max(1, full_count)
+                                float(value.detach()) / full_count
                             )
                     for parameter in discriminator.parameters():
                         parameter.requires_grad_(False)
                     generator_loss = losses.full_generator(
                         result, discriminator, adversarial_factor=gan_factor
                     )
+                    if gan_active:
+                        discriminator_forwards += 1
+                    if stage == "stage1b":
+                        generator_loss.total = (
+                            p47_objective_weight * generator_loss.total
+                        )
+                        for name, value in generator_loss.terms.items():
+                            metrics[f"p47/{name}"] = float(value.detach())
+                        for name, value in generator_loss.statistics.items():
+                            metrics[f"p47/{name}"] = float(value.detach())
                     for parameter in discriminator.parameters():
                         parameter.requires_grad_(True)
                 elif task.kind == "single_prefix":
@@ -890,16 +982,20 @@ def main() -> None:
             training["gradient_clip"],
             error_if_nonfinite=True,
         )
-        discriminator_grad_norm = torch.nn.utils.clip_grad_norm_(
-            discriminator.parameters(),
-            training["gradient_clip"],
-            error_if_nonfinite=True,
-        )
+        discriminator_grad_norm = 0.0
+        if gan_active:
+            discriminator_grad_norm = float(
+                torch.nn.utils.clip_grad_norm_(
+                    discriminator.parameters(),
+                    training["gradient_clip"],
+                    error_if_nonfinite=True,
+                )
+            )
         metrics["grad_norm/generator"] = float(generator_grad_norm)
-        metrics["grad_norm/discriminator"] = float(discriminator_grad_norm)
+        metrics["grad_norm/discriminator"] = discriminator_grad_norm
         generator_optimizer.step()
         generator_scheduler.step()
-        if full_count and gan_factor > 0:
+        if gan_active:
             discriminator_optimizer.step()
             discriminator_scheduler.step()
             discriminator_update_count += 1
@@ -929,9 +1025,13 @@ def main() -> None:
                 "objective_mode": objective_mode,
                 "objective/prefix_active": int(stage == "stage1b"),
                 "objective/repa_active": 1,
+                "objective/gan_active": int(gan_active),
+                "objective/gan_factor": gan_factor,
                 "system/step_seconds": step_seconds,
                 "system/clips_per_second": len(tasks) * world_size / step_seconds,
+                "system/decoder_views": decoder_views,
                 "system/decoder_views_per_second": decoder_views * world_size / step_seconds,
+                "system/discriminator_forwards": discriminator_forwards,
                 "time/data": data_seconds,
                 "time/projector": model_timings.get("projector", 0.0),
                 "time/wan_forward": model_timings.get("wan_forward", 0.0),
@@ -941,7 +1041,11 @@ def main() -> None:
                 "system/max_memory_gib": torch.cuda.max_memory_allocated(device) / 2**30,
                 "schedule/phase": active_phase,
                 "system/gradient_checkpointing": int(checkpoint_enabled),
+                "schedule/full": task_counts["full"],
+                "schedule/single_prefix": task_counts["single_prefix"],
+                "schedule/paired_prefix": task_counts["paired_prefix"],
                 "schedule/task_counts": task_counts,
+                "discriminator/update_count": discriminator_update_count,
                 "prefix/single_endpoint_histogram": prefix_histograms["single"],
                 "prefix/paired_endpoint_histogram": prefix_histograms["paired"],
                 "lr": {

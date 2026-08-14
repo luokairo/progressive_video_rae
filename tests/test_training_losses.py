@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -56,7 +58,7 @@ def test_prefix_loss_uses_configured_weights(monkeypatch):
         build_output(reconstruction=prediction, target=target),
         target,
         endpoint=47,
-        full_target=target,
+        previous_prediction=torch.zeros_like(prediction),
     )
 
     assert result.total.item() == pytest.approx(8.0)
@@ -150,7 +152,6 @@ def test_prefix_loss_uses_temporal_l1_weight(monkeypatch):
         build_output(reconstruction=prediction, target=target),
         target,
         endpoint=47,
-        full_target=target,
     )
 
     assert result.terms["temporal_l1"].item() == pytest.approx(1.5)
@@ -252,3 +253,196 @@ def test_frozen_lpips_checkpoint_preserves_value_and_prediction_gradient():
 
     torch.testing.assert_close(actual, reference, atol=0.0, rtol=0.0)
     torch.testing.assert_close(actual_gradient, reference_gradient, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "expected_level", "expected_grid", "expected_scale"),
+    (
+        (0, 0, (1, 1), 0.0),
+        (7, 0, (1, 1), 0.0),
+        (8, 1, (2, 3), 0.2),
+        (15, 1, (2, 3), 0.2),
+        (16, 2, (4, 6), 0.4),
+        (23, 2, (4, 6), 0.4),
+        (24, 3, (8, 12), 0.6),
+        (31, 3, (8, 12), 0.6),
+        (32, 4, (15, 24), 0.8),
+        (39, 4, (15, 24), 0.8),
+        (40, 5, (30, 48), 1.0),
+        (46, 5, (30, 48), 1.0),
+    ),
+)
+def test_hierarchical_repa_level_boundaries(
+    endpoint, expected_level, expected_grid, expected_scale
+):
+    level, grid, scale = losses_module.hierarchical_repa_level(endpoint)
+
+    assert level == expected_level
+    assert grid == expected_grid
+    assert scale == pytest.approx(expected_scale)
+
+
+def test_hierarchical_repa_rejects_p47_full_anchor():
+    with pytest.raises(ValueError, match=r"\[0,46\]"):
+        losses_module.hierarchical_repa_level(47)
+
+
+def test_hierarchical_repa_keeps_groups_and_phases_separate():
+    anchor = torch.tensor([1.0, 0.0]).reshape(1, 1, 1, 1, 2).expand(1, 1, 4, 6, 2)
+    phase_vectors = torch.tensor(
+        [[[[1.0, 0.0], [0.0, 1.0]], [[-1.0, 0.0], [0.0, -1.0]]]]
+    ).reshape(1, 2, 2, 1, 1, 2)
+    predicted_phases = phase_vectors.expand(1, 2, 2, 4, 6, 2)
+    target_phases = (
+        torch.tensor([1.0, 0.0])
+        .reshape(1, 1, 1, 1, 1, 2)
+        .expand_as(predicted_phases)
+    )
+
+    terms = losses_module.hierarchical_repa_terms(
+        RepaReference(anchor=anchor, video_phases=predicted_phases),
+        RepaReference(anchor=anchor, video_phases=target_phases),
+        endpoint=16,
+    )
+
+    expected = torch.tensor([[0.0, 1.0], [2.0, 1.0]])
+    torch.testing.assert_close(terms.group_phase_global_errors, expected)
+    torch.testing.assert_close(terms.group_phase_local_errors, expected)
+
+
+def test_prefix_loss_adds_hierarchical_repa_and_reports_pyramid_statistics(
+    monkeypatch,
+):
+    monkeypatch.setattr(losses_module, "FrozenLPIPS", ConstantLPIPS)
+
+    def frequency_terms_without_dct(prediction, full_target, endpoint):
+        assert endpoint == 16
+        coefficients = torch.zeros_like(prediction)
+        return SimpleNamespace(
+            target=full_target,
+            target_coefficients=coefficients,
+            prediction_coefficients=coefficients,
+            band_mask=torch.zeros_like(coefficients, dtype=torch.bool),
+            leakage=prediction.sum() * 0.0,
+        )
+
+    monkeypatch.setattr(
+        losses_module, "progressive_frequency_terms", frequency_terms_without_dct
+    )
+    losses = losses_module.ProgressiveLosses(
+        l1_weight=0.0,
+        prefix_lpips_weight=0.0,
+        temporal_l1_weight=0.0,
+        band_weight=0.0,
+        leakage_weight=0.0,
+        paired_delta_weight=0.0,
+        prefix_repa_global_weight=1.0,
+        prefix_repa_local_weight=1.0,
+    )
+    predicted_anchor = torch.randn(1, 1, 4, 6, 3, requires_grad=True)
+    predicted_phases = torch.randn(1, 2, 2, 4, 6, 3, requires_grad=True)
+    teacher_anchor = torch.randn_like(predicted_anchor, requires_grad=True)
+    teacher_phases = torch.randn_like(predicted_phases, requires_grad=True)
+    reconstruction = torch.zeros(1, 3, 1, 2, 2, requires_grad=True)
+    target = torch.zeros_like(reconstruction)
+    result = losses.prefix(
+        build_output(
+            reconstruction=reconstruction,
+            target=target,
+            repa_features=RepaReference(predicted_anchor, predicted_phases),
+            reference=RepaReference(teacher_anchor, teacher_phases),
+        ),
+        target,
+        endpoint=16,
+    )
+
+    expected = result.terms["prefix_repa_global"] + 0.4 * result.terms[
+        "prefix_repa_local"
+    ]
+    torch.testing.assert_close(result.total, expected)
+    assert result.statistics["prefix_repa/level"].item() == 2
+    assert result.statistics["prefix_repa/grid_height"].item() == 4
+    assert result.statistics["prefix_repa/grid_width"].item() == 6
+    result.total.backward()
+    assert predicted_anchor.grad is not None
+    assert predicted_phases.grad is not None
+    assert teacher_anchor.grad is None
+    assert teacher_phases.grad is None
+
+
+def test_prefix_hrepa_freezes_teacher_and_head_but_backpropagates_upstream():
+    from progressive_videorae.model.model import PhaseSpecificRepaProjection
+
+    upstream = nn.Conv3d(4, 8, 1)
+    repa_head = PhaseSpecificRepaProjection(8, 6).requires_grad_(False)
+    decoder_features = upstream(torch.randn(1, 4, 3, 8, 12))
+    prediction = repa_head(decoder_features)
+    teacher_anchor = torch.randn_like(prediction.anchor, requires_grad=True)
+    teacher_phases = torch.randn_like(prediction.video_phases, requires_grad=True)
+
+    terms = losses_module.hierarchical_repa_terms(
+        prediction,
+        RepaReference(anchor=teacher_anchor, video_phases=teacher_phases),
+        endpoint=24,
+    )
+    (terms.global_loss + terms.local_scale * terms.local_loss).backward()
+
+    assert all(parameter.grad is None for parameter in repa_head.parameters())
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum() > 0
+        for parameter in upstream.parameters()
+    )
+    assert teacher_anchor.grad is None
+    assert teacher_phases.grad is None
+
+
+class CountingDiscriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def forward(self, video):
+        self.calls += 1
+        return video.mean(dim=(1, 2, 3, 4), keepdim=True) + 0.25
+
+
+def test_p47_gan_ramp_scales_generator_and_discriminator_with_three_forwards(monkeypatch):
+    monkeypatch.setattr(losses_module, "FrozenLPIPS", ConstantLPIPS)
+    losses = losses_module.ProgressiveLosses(
+        l1_weight=0.0,
+        lpips_weight=0.0,
+        repa_local_weight=0.0,
+        repa_global_weight=0.0,
+        adversarial_weight=0.05,
+    )
+    prediction = torch.zeros(1, 3, 1, 2, 2)
+    target = torch.ones_like(prediction)
+    reference = RepaReference(
+        anchor=torch.ones(1, 1, 1, 1, 2),
+        video_phases=torch.empty(1, 0, 2, 1, 1, 2),
+    )
+    output = build_output(
+        reconstruction=prediction,
+        target=target,
+        repa_features=reference,
+        reference=reference,
+    )
+    discriminator = CountingDiscriminator()
+
+    disc_loss = losses.discriminator(
+        discriminator,
+        prediction,
+        target,
+        adversarial_factor=0.5,
+    )
+    generator_loss = losses.full_generator(
+        output,
+        discriminator,
+        adversarial_factor=0.5,
+    )
+
+    assert discriminator.calls == 3
+    assert disc_loss.terms["disc_total"].item() == pytest.approx(0.625)
+    assert disc_loss.total.item() == pytest.approx(0.3125)
+    assert generator_loss.terms["adversarial"].item() == pytest.approx(-0.25)
+    assert generator_loss.weighted_terms["adversarial"].item() == pytest.approx(-0.00625)

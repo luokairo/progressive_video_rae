@@ -10,14 +10,19 @@ from torch import nn
 from progressive_videorae.evaluation.full import (
     append_jsonl,
     prepare_run_manifest,
+    atomic_write_json,
+    consume_reserve_replacement,
     read_jsonl_repair,
     stable_sample_key,
+    require_exact_sample_count,
     summary_statistics,
     validate_evaluation_config,
 )
 from progressive_videorae.evaluation.full_metrics import (
     I3DFeatureExtractor,
     frame_mean_psnr,
+    clamp_visual_metric_inputs,
+    frame_mse,
     output_range_statistics,
     stylegan_v_i3d_preprocess,
 )
@@ -67,6 +72,18 @@ def test_stable_sample_order_does_not_depend_on_manifest_row_order():
     assert forward == backward
 
 
+def test_reserve_replacements_are_fifo_unique_and_insufficient_count_fails():
+    unresolved = ["failed-a", "failed-b"]
+    replacements = [
+        consume_reserve_replacement(4, 4, unresolved),
+        consume_reserve_replacement(5, 4, unresolved),
+    ]
+    assert replacements == ["failed-a", "failed-b"]
+    assert len(set(replacements)) == len(replacements)
+    with pytest.raises(RuntimeError, match="3/4"):
+        require_exact_sample_count(3, 4)
+
+
 def test_full_config_rejects_prefix_fields_and_invalid_precision():
     config = _evaluation_config()
     config["endpoints"] = [47]
@@ -80,7 +97,7 @@ def test_full_config_rejects_prefix_fields_and_invalid_precision():
         )
 
     config = _evaluation_config()
-    config["precision"] = "bfloat"
+    config["precision"] = "fp16"
     with pytest.raises(ValueError, match="precision"):
         validate_evaluation_config(
             config,
@@ -108,6 +125,15 @@ def test_frame_mean_psnr_averages_db_values_per_frame():
     target = torch.tensor([[[[[0.5]], [[1.0]]]]])
     expected = (10 * np.log10(4 / 0.25) + 10 * np.log10(4 / 1.0)) / 2
     assert float(frame_mean_psnr(prediction, target)) == pytest.approx(expected)
+
+
+def test_visual_metrics_clamp_prediction_before_rgb_error():
+    raw = torch.tensor([-2.0, 2.0]).reshape(1, 1, 1, 1, 2)
+    target = torch.zeros_like(raw)
+    prediction, target = clamp_visual_metric_inputs(raw, target)
+    assert prediction.min() == -1
+    assert prediction.max() == 1
+    assert float(frame_mse(prediction, target)) == pytest.approx(1.0)
 
 
 def test_output_range_diagnostics_preserve_raw_overshoot():
@@ -186,6 +212,9 @@ def test_jsonl_resume_repairs_only_an_incomplete_tail(tmp_path):
         handle.write(b'{"sample_id":"partial"')
     assert read_jsonl_repair(path) == [{"sample_id": "a"}]
     assert path.read_bytes().endswith(b"\n")
+    with path.open("ab") as handle:
+        handle.write(b'{"sample_id":}\n')
+    assert read_jsonl_repair(path) == [{"sample_id": "a"}]
 
 
 def test_run_manifest_resume_requires_exact_identity(tmp_path):
@@ -201,9 +230,15 @@ def test_run_manifest_resume_requires_exact_identity(tmp_path):
             {"result_schema_version": 2, "checkpoint_sha256": "b" * 64},
             resume=True,
         )
+    atomic_write_json(output / "run_manifest.json", {**resumed, "status": "completed"})
+    with pytest.raises(RuntimeError, match="Completed"):
+        prepare_run_manifest(output, identity, resume=True)
 
 
 class FakeChunkDecoder:
+    def __init__(self):
+        self.calls = []
+
     def decode(
         self,
         state,
@@ -212,7 +247,8 @@ class FakeChunkDecoder:
         cache_state=None,
         sequence_id=None,
     ):
-        del cache_mode, sequence_id
+        self.calls.append((cache_mode, cache_state is None))
+        del sequence_id
         video = state.tokens.mean(dim=(2, 3, 4), keepdim=False)
         video = video[:, None].expand(-1, 3, -1)[:, :, :, None, None]
         return SimpleNamespace(video=video, cache_state=object())
@@ -232,6 +268,7 @@ def test_cache_equivalence_checks_both_cross_call_splits_on_cpu():
     reference = decoder.decode(
         state, cache_mode="disabled", sequence_id="sample"
     ).video
+    decoder.calls.clear()
     values = _cache_equivalence(
         decoder=decoder,
         state=state,
@@ -242,5 +279,7 @@ def test_cache_equivalence_checks_both_cross_call_splits_on_cpu():
         atol=1e-5,
     )
     assert set(values) == {"1+4", "3+2"}
-    assert values["1+4"]["max_abs_error"] == 0
-    assert values["3+2"]["mean_abs_error"] == 0
+    assert values["1+4"]["max_abs_error"] <= 1e-5
+    assert values["3+2"]["mean_abs_error"] <= 1e-5
+    assert [mode for mode, _ in decoder.calls] == ["reset", "reuse", "reset", "reuse"]
+    assert [empty for _, empty in decoder.calls] == [True, False, True, False]

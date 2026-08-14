@@ -6,7 +6,6 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from ..model.types import EncoderOutput, PrefixEncoderOutput
-from ..training.losses import FrozenLPIPS
 from .full import FVD_FEATURE_DIM
 
 
@@ -50,6 +49,18 @@ def temporal_difference_l1(prediction: Tensor, target: Tensor) -> Tensor:
     )
 
 
+def clamp_visual_metric_inputs(
+    prediction_raw: Tensor, target: Tensor
+) -> tuple[Tensor, Tensor]:
+    if prediction_raw.shape != target.shape or prediction_raw.ndim != 5:
+        raise ValueError("Visual metrics require matching [B,C,T,H,W] tensors")
+    if not torch.isfinite(prediction_raw).all() or not torch.isfinite(target).all():
+        raise FloatingPointError("Visual metric inputs contain non-finite values")
+    return (
+        prediction_raw.float().clamp(-1.0, 1.0),
+        target.float().clamp(-1.0, 1.0),
+    )
+
 def output_range_statistics(prediction_raw: Tensor) -> dict[str, float]:
     overshoot = (prediction_raw.detach().float().abs() - 1.0).clamp_min(0.0)
     return {
@@ -80,10 +91,30 @@ def encoder_cosine(
     return local, global_score
 
 
+class EvaluationLPIPS(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        try:
+            import lpips
+        except ImportError as exc:
+            raise ImportError("Install lpips to evaluate perceptual similarity") from exc
+        self.model = lpips.LPIPS(net="vgg").eval().requires_grad_(False)
+
+    def forward(self, prediction: Tensor, target: Tensor, chunk_size: int = 4) -> Tensor:
+        b, c, t, h, w = prediction.shape
+        pred = prediction.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        real = target.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        values = [
+            self.model(pred[start : start + chunk_size], real[start : start + chunk_size])
+            for start in range(0, pred.shape[0], chunk_size)
+        ]
+        return torch.cat(values).mean()
+
+
 class FullReconstructionMetricSuite(nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.lpips = FrozenLPIPS()
+        self.lpips = EvaluationLPIPS()
 
     @torch.no_grad()
     def forward(self, prediction_raw: Tensor, target: Tensor) -> dict[str, float]:

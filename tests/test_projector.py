@@ -60,6 +60,23 @@ def test_prefix_uses_one_strictly_zero_initialized_shared_mask_token():
     assert torch.count_nonzero(projector.shared_mask_set) == 0
 
 
+def test_only_masked_prefix_views_backpropagate_to_shared_mask():
+    projector = make_projector().train()
+    features = make_features(torch.randn(1, 1, 30, 48, 8))
+
+    canonical = projector(features).state
+    canonical.tokens.sum().backward()
+    assert projector.shared_mask_set.grad is None
+
+    projector.zero_grad(set_to_none=True)
+    canonical = projector(features).state
+    prefix = projector.make_prefix_view(canonical, 12)
+    prefix.tokens[:, :, 13:].sum().backward()
+
+    assert projector.shared_mask_set.grad is not None
+    assert torch.count_nonzero(projector.shared_mask_set.grad) > 0
+
+
 def test_full_state_and_phase_specific_repa_shapes():
     projector = make_projector()
     anchor = torch.randn(1, 1, 30, 48, 8)

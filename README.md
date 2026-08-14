@@ -98,7 +98,17 @@ epoch；跨阶段应使用 `--init-from`，只继承模型与 discriminator 权�
 `--allow-smoke-checkpoint` 作 smoke/迁移；它不会放宽 stage adjacency、shape、
 StateContract、上游 commit 或 V-JEPA/Wan identity 校验。
 
-Stage 1B 每个 optimizer update 固定执行 `4 full + 3 single-prefix + 1 paired-prefix`，使用8个microbatch完成一次梯度累积；paired-prefix的两个相邻endpoint loss取平均。REPA/GAN只属于full路径。Stage 2-A/B都只使用canonical `P_47`，不构造`SpatialPrefixView`、不采样endpoint、也不计算DCT-prefix loss；两阶段都保留phase-specific REPA loss。Stage 2冻结REPA head参数，但固定head仍参与forward，REPA梯度继续回传到bridge/adapter/Wan。
+Stage 1B 的正式 objective 是 `nested_spectral_hrepa_full_anchor`。每个 optimizer
+update 固定执行 `7 × P_0…P_46 + 1 × P_47 full anchor`，单步随机打乱，8 个
+microbatch 都只解码一次。`P_0…P_46` 使用 nested RGB/DCT loss 和六级 spatial
+Hierarchical REPA；`P_47` 使用 canonical state，走标准 full RGB、local/global REPA
+和权重 `0.05` 的 ramped GAN。正式 schedule 不执行 paired decode。
+
+Stage 1B 冻结 REPA head 和 Wan 空间主体，只训练 projector、shared mask、temporal
+adapter、pre-decoder、Wan `conv1` 与全部 `time_conv`；固定 REPA head 仍让梯度回传到
+decoder feature 与 state 路径。Stage 2-A/B 都只使用 canonical `P_47`，不构造
+`SpatialPrefixView`、不采样 endpoint、也不计算 DCT-prefix loss；两阶段继续使用
+phase-specific REPA。
 
 ViT-L 与 ViT-g 的完整训练 checkpoint 不能相互初始化或 `--resume`。正式训练入口不再
 提供 decoder-only 的 `--init-decoder-from` 旁路；切换 encoder variant 应建立独立的
@@ -124,6 +134,43 @@ python -m progressive_videorae.evaluate \
   --config configs/eval/full_480p.yaml \
   --checkpoint /path/to/checkpoint.pt \
   --output-dir /path/to/eval_output
+```
+
+阶段结束时使用固定 validation 集增量选择 checkpoint（不运行 test、TokenBench 或
+DAVIS）：
+
+先在独立 GPU 节点用同一稳定排序协议对 step 100 做两样本 smoke；该模式不会生成
+leaderboard 或 best，且不能与 `--watch/--resume` 混用：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 pvr-select-checkpoints \
+  --stage stage1a \
+  --checkpoint-dir /share/project/liujingyi/ckpts/progressive_video_rae/training/stage1a/20260810T164351406148Z \
+  --config configs/eval/checkpoint_selection_17f.yaml \
+  --output-dir /share/project/liujingyi/ckpts/progressive_video_rae/selection_smoke/stage1a/20260810T164351406148Z \
+  --smoke-step 100 --smoke-samples 2
+```
+
+smoke 通过后启动正式的 5,000 条增量选择：
+
+```bash
+CUDA_VISIBLE_DEVICES=0 pvr-select-checkpoints \
+  --stage stage1a \
+  --checkpoint-dir /share/project/liujingyi/ckpts/progressive_video_rae/training/stage1a/20260810T164351406148Z \
+  --config configs/eval/checkpoint_selection_17f.yaml \
+  --output-dir /share/project/liujingyi/ckpts/progressive_video_rae/selection/stage1a/20260810T164351406148Z \
+  --watch --poll-seconds 60
+```
+
+首次运行会从能够支持 33 帧的 validation 记录中稳定解码并冻结 5,000 条样本；重启时
+增加 `--resume`。每个 checkpoint 只重建完整 `P_47`，以 LPIPS 最低为主排名，随后以
+PSNR、SSIM 和 step 打破完全平局。Stage 2-B 同时运行 17 帧主排名和 33 帧诊断协议。
+训练默认仍从 `stage_final.pt` 交接；若显式使用中间 winner，则必须同时提供证书：
+
+```bash
+pvr-train --config configs/train/stage1b.yaml \
+  --init-from /path/to/evaluation_best.pt \
+  --selection-certificate /path/to/evaluation_best.json
 ```
 
 评估仅使用完整 `P_47` state，默认从完整 test manifest 中稳定抽取 2048 个可解码

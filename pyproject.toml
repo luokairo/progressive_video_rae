@@ -39,6 +39,8 @@ dev = ["pytest>=8", "ruff>=0.6"]
 pvr-build-manifest = "progressive_videorae.data.build_manifest:main"
 pvr-train = "progressive_videorae.train:main"
 pvr-evaluate = "progressive_videorae.evaluate:main"
+pvr-compare-stages = "progressive_videorae.evaluation.compare:main"
+pvr-select-checkpoints = "progressive_videorae.evaluation.selection:main"
 pvr-validate-checkpoints = "progressive_videorae.tools.validate_checkpoints:main"
 
 [tool.setuptools.packages.find]

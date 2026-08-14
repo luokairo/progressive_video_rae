@@ -19,7 +19,7 @@ conda activate waverae
 2. Frozen V-JEPA2 对 `F=1+4n` 执行 native full-attention prefixes。17 帧使用 `2/6/10/14/18`，33 帧继续到 `34`；每个 prefix 提取末端 `1/2` 个 tubelets。
 3. Projector 对选层做 softmax mixing。anchor 独立投影，video group 通过 phase embedding 与 learned-query attention 融合两个 tubelets。
 4. `30×48=1440` 个位置按 center-first FPS 排序，形成 `[S=48,K=30]`；4 层 block-set-causal transformer 后沿 `C=48` 做 affine LayerNorm。
-5. Canonical state 始终先完整计算为 `[B,T,48,30,48]`。Stage 1B 再从完整state构造prefix view：sets `0…s`保留真实token，`s+1…47`使用一个全局共享、严格零初始化的mask token；`SpatialPrefixView`不伪装成canonical state。
+5. Canonical state 始终先完整计算为 `[B,T,48,30,48]`。Stage 1B 的 `P_0…P_46` 再从完整state构造prefix view：sets `0…s`保留真实token，`s+1…47`使用一个全局共享、严格零初始化的mask token；`P_47`直接使用canonical state，`SpatialPrefixView`不伪装成canonical state。
 6. Decoder inverse-FPS 后对每个 latent 依次执行 zero-init latent-causal bridge、
    near-identity StateToWan、Wan inverse normalization、预训练
    `conv2 + Decoder3d`，并立即更新 RAE history 与 Wan feature cache。
@@ -44,15 +44,27 @@ state/view/decoder 每次调用都交叉校验这两个 layout 身份字段。
 | Stage | RGB | Objective | Prefix | REPA |
 |---|---:|---|---|---|
 | Stage 1A | 17 | `full_repa` | 无 | 训练 head，loss 开启 |
-| Stage 1B | 17 | `full_repa_spatial_prefix` | 仅 prefix microbatches | 仅 full microbatches |
+| Stage 1B | 17 | `nested_spectral_hrepa_full_anchor` | 7个随机 `P_0…P_46` + 1个 `P_47` full anchor | head冻结，prefix/full loss开启 |
 | Stage 2-A | 17 | `full_repa` | 无 | head 冻结，loss 开启 |
 | Stage 2-B | 33 | `full_repa_stateful` | 无 | head 冻结，loss 开启 |
 
 Stage 2-A/B 启动校验拒绝任何 prefix 配置。冻结 REPA head 不会切断 autograd；固定 head 的输入梯度继续更新 bridge、StateToWan 和 Wan decoder。
 
-Stage 1B 每个optimizer update固定执行4个full、3个single-prefix和1个paired-prefix microbatch。single endpoint为`0…46`，paired endpoint为`1…47`；任务在单步内部打乱，paired的两个相邻endpoint顺序解码并对loss取平均。DCT是逐RGB帧float32 orthonormal 2D DCT，不做时间DCT。
+Stage 1B 每个 optimizer update 固定执行 7 个均匀采样的 `P_0…P_46` 和 1 个
+canonical `P_47` full anchor。任务在单步内部打乱，每个 microbatch 只解码一次，正式
+schedule 不生成 paired task，因此单步固定为 8 个 decoder view。
 
-Wan整体保持cache-aware gradient checkpointing，以满足480p训练的显存约束。
+Prefix REPA 使用六级空间池化金字塔：`1×1`、`2×3`、`4×6`、`8×12`、
+`15×24`、`30×48`，对应 endpoint 桶 `0–7`、`8–15`、`16–23`、`24–31`、
+`32–39`、`40–46`，local scale 为 `0,.2,.4,.6,.8,1`。anchor 和每个 video group
+的 `f0/f1` 分别池化；global 始终在各自 `1×1` 表征上计算，不跨 latent 或 phase
+混合。固定 REPA head 的 prediction 侧保留 autograd，teacher 侧 detach。
+
+Wan 整体保持 cache-aware gradient checkpointing，以满足 480p 训练的显存约束。
+Stage 1B 训练 projector、shared mask、temporal adapter、pre-decoder、Wan `conv1` 和
+全部 `time_conv`；其余 Wan 空间主体和 output head 冻结，但 decoder 父模块保持 train
+mode。对外 `cache_mode=disabled`，单 view 内仍逐 latent 使用一次性 RAE/Wan cache，
+view 之间不复用 cache。
 
 ## Weight loading and runtime boundaries
 
@@ -83,16 +95,19 @@ Wan整体保持cache-aware gradient checkpointing，以满足480p训练的显存
 
 ## Loss routing
 
-- Full：L1、LPIPS、temporal L1、phase-specific local/global REPA、按计划启动的 PatchGAN。
-- Prefix：累计低通重建、LPIPS、band、frequency leakage、paired delta；不含 REPA/GAN。
-- Stage 2-A/B 日志必须为 `objective/prefix_active=0`、`objective/repa_active=1`。
+- Stage 1B `P_0…P_46`：低通 L1、prefix LPIPS、temporal L1、当前 band、frequency
+  leakage，加上 `global REPA + local_scale × local REPA`；不调用 discriminator。
+- Stage 1B `P_47`：标准 full L1、LPIPS、temporal L1、phase-specific local/global
+  REPA 和 PatchGAN；不额外计算 B47 band。GAN 权重为 `0.05`，step 0–1000 的 factor
+  同时线性缩放 generator adversarial loss 与 discriminator loss。
+- Stage 1B 日志固定记录 `objective/prefix_active=1`、`objective/repa_active=1`、
+  `schedule/full=1`、`schedule/single_prefix=7`、`schedule/paired_prefix=0` 和
+  `system/decoder_views=8`，并记录 endpoint HREPA、金字塔 grid、P47 full 与 GAN 统计。
 - BF16 下 DCT 在 autocast-disabled 的 float32 区域计算。
-- `prefix_objective_weight` 对 single-prefix total 乘一次；paired-prefix 先平均相邻
-  两个 endpoint total，再乘一次。
-- REPA 额外记录 anchor、每个 group 的 `f0/f1` error，以及 Stage 2-B tail-four
-  mean/worst；这些统计不改变 total loss。
-- `GlobalMetricWindow` 分开累计 single/paired endpoint histogram，并按 endpoint
-  汇总 L1、band、leakage 与 paired-delta，在日志窗口末统一做一次 DDP reduce。
+- 所有 generator microbatch loss 除以 8；`prefix_objective_weight` 与
+  `p47_objective_weight` 均为 `1.0`。
+- 正式 Stage 1B 只累计 single endpoint histogram，并按 endpoint 汇总 RGB/DCT 与
+  HREPA；paired 实验 API 保留但不由正式 schedule 调用。
 
 ## Checkpoint identity
 

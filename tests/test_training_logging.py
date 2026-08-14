@@ -8,6 +8,11 @@ import pytest
 torch = pytest.importorskip("torch")
 from torch import nn
 
+from progressive_videorae.train import (
+    PREFIX_WINDOW_TERMS,
+    _prefix_window_metric_names,
+    record_prefix_window,
+)
 from progressive_videorae.training.checkpoint import representation_identity, save_checkpoint
 from progressive_videorae.model.types import StateContract
 from progressive_videorae.training.logging import (
@@ -37,6 +42,36 @@ def test_metric_window_reports_global_means_logits_and_prefix_histogram():
     assert metrics["disc/fake_logit_mean"] == pytest.approx(0.0)
     assert metrics["disc/fake_logit_std"] == pytest.approx(1.0)
     assert histogram == {"single": {"1": 2}, "paired": {"47": 1}}
+
+
+def test_prefix_metric_window_records_hrepa_statistics_by_endpoint():
+    window = GlobalMetricWindow(
+        _prefix_window_metric_names(),
+        device=torch.device("cpu"),
+        prefix_bins=48,
+    )
+    loss = SimpleNamespace(
+        terms={name: torch.tensor(float(index)) for index, name in enumerate(PREFIX_WINDOW_TERMS)},
+        statistics={
+            "prefix_repa/level": torch.tensor(2.0),
+            "prefix_repa/grid_height": torch.tensor(4.0),
+            "prefix_repa/grid_width": torch.tensor(6.0),
+            "prefix_repa/local_scale": torch.tensor(0.4),
+            "prefix_repa/anchor_global_error": torch.tensor(0.25),
+            "prefix_repa/group_00/f0_local_error": torch.tensor(0.5),
+        },
+    )
+
+    record_prefix_window(window, kind="single", endpoint=16, loss=loss)
+    metrics, histogram = window.reduce()
+
+    base = "prefix/single/endpoint_16"
+    assert metrics[f"{base}/prefix_repa_global"] == pytest.approx(4.0)
+    assert metrics[f"{base}/prefix_repa/level"] == pytest.approx(2.0)
+    assert metrics[f"{base}/prefix_repa/grid_height"] == pytest.approx(4.0)
+    assert metrics[f"{base}/prefix_repa/local_scale"] == pytest.approx(0.4)
+    assert metrics[f"{base}/prefix_repa/group_00/f0_local_error"] == pytest.approx(0.5)
+    assert histogram == {"single": {"16": 1}, "paired": {}}
 
 
 def test_metric_window_uses_distributed_sum_when_initialized(monkeypatch):
