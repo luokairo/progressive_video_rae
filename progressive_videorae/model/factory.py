@@ -82,6 +82,9 @@ def build_model(
         num_heads=projector_config["num_heads"],
         mlp_ratio=projector_config["mlp_ratio"],
         dropout=projector_config["dropout"],
+        spatial_attention_mode=projector_config.get(
+            "spatial_attention_mode", "set_causal"
+        ),
         layout_version=state["layout_version"],
     )
     decoder = WanVideoDecoder(

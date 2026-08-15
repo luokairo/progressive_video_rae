@@ -36,6 +36,7 @@ class CausalFrequencyProjector(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        spatial_attention_mode: str = "set_causal",
         layout_version: str = LAYOUT_VERSION,
         set_sizes: tuple[int, ...] = SET_SIZES,
     ) -> None:
@@ -45,12 +46,18 @@ class CausalFrequencyProjector(nn.Module):
             raise ValueError("candidate v3 fixes the state channel width at 48")
         if tuple(set_sizes) != SET_SIZES:
             raise ValueError("candidate v3 requires 48 equal sets of 30 tokens")
+        if spatial_attention_mode not in ("set_causal", "full"):
+            raise ValueError(
+                "spatial_attention_mode must be 'set_causal' or 'full', "
+                f"got {spatial_attention_mode!r}"
+            )
         self.num_input_layers = int(num_input_layers)
         self.max_context_frames = int(max_context_frames)
         self.height = int(height)
         self.width = int(width)
         self.hidden_dim = int(hidden_dim)
         self.output_dim = int(output_dim)
+        self.spatial_attention_mode = spatial_attention_mode
 
         layout = build_progressive_layout(height, width, set_sizes, layout_version)
         self.layout_version = layout.version
@@ -194,9 +201,14 @@ class CausalFrequencyProjector(nn.Module):
     def _project_hidden(self, hidden: Tensor, token_count: int) -> Tensor:
         b, t, _, c = hidden.shape
         selected = hidden[:, :, :token_count]
+        attention_mask = None
+        if self.spatial_attention_mode == "set_causal":
+            attention_mask = self.causal_attention_mask[:token_count, :token_count].to(
+                hidden.device
+            )
         hidden = self.transformer(
             selected.reshape(b * t, token_count, c),
-            mask=self.causal_attention_mask[:token_count, :token_count].to(hidden.device),
+            mask=attention_mask,
         )
         canonical = self.state_norm(self.output_projection(self.output_norm(hidden)))
         return canonical.reshape(b, t, token_count // 30, 30, self.output_dim)

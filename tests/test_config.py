@@ -76,6 +76,7 @@ class StubProjector(nn.Module):
     def __init__(self, *, input_dim: int, **_kwargs):
         super().__init__()
         self.input_dim = input_dim
+        self.spatial_attention_mode = _kwargs["spatial_attention_mode"]
         from progressive_videorae.model.types import StateContract
         self.contract = StateContract()
 
@@ -101,6 +102,7 @@ def test_factory_uses_backbone_embed_dim_and_supports_legacy_names(monkeypatch):
     assert model.projector.input_dim == 1408
     assert model.decoder.base_dim == 256
     assert model.repa_projection.anchor.out_channels == 1408
+    assert model.projector.spatial_attention_mode == "set_causal"
 
     config["encoder"]["name"] = "vjepa2_vitl16"
     config["encoder"].pop("variant")
@@ -110,6 +112,20 @@ def test_factory_uses_backbone_embed_dim_and_supports_legacy_names(monkeypatch):
         config, load_decoder_pretrained=False, validate_pretrained=False
     )
     assert model.encoder.variant == "vitl"
+
+def test_factory_passes_full_spatial_attention_mode(monkeypatch):
+    monkeypatch.setattr(factory, "VJEPA2Encoder", StubVJEPA2Encoder)
+    monkeypatch.setattr(factory, "CausalFrequencyProjector", StubProjector)
+    monkeypatch.setattr(factory, "WanVideoDecoder", StubDecoder)
+    config = load_yaml("configs/model/full_480p.yaml")
+    config["projector"]["spatial_attention_mode"] = "full"
+
+    model = factory.build_model(
+        config, load_decoder_pretrained=False, validate_pretrained=False
+    )
+
+    assert model.projector.spatial_attention_mode == "full"
+
 
 
 def test_factory_rejects_configured_embed_dim_mismatch(monkeypatch):

@@ -27,7 +27,7 @@ def make_features(tensor):
     )
 
 
-def make_projector():
+def make_projector(*, spatial_attention_mode="set_causal"):
     return CausalFrequencyProjector(
         input_dim=8,
         hidden_dim=16,
@@ -36,6 +36,7 @@ def make_projector():
         num_heads=4,
         mlp_ratio=2.0,
         dropout=0.0,
+        spatial_attention_mode=spatial_attention_mode,
     ).eval()
 
 
@@ -48,6 +49,22 @@ def test_future_set_perturbation_cannot_change_earlier_output():
     first = projector(make_features(tensor)).state.tokens
     second = projector(make_features(perturbed)).state.tokens
     torch.testing.assert_close(first[:, :, :47], second[:, :, :47], atol=1e-5, rtol=1e-5)
+
+def test_full_attention_allows_future_set_to_change_earlier_output():
+    torch.manual_seed(7)
+    projector = make_projector(spatial_attention_mode="full")
+    tensor = torch.randn(1, 1, 30, 48, 8)
+    perturbed = tensor.clone()
+    perturbed[:, :, projector.set_ids == 47] += 100.0
+    first = projector(make_features(tensor)).state.tokens
+    second = projector(make_features(perturbed)).state.tokens
+    assert not torch.allclose(first[:, :, :47], second[:, :, :47], atol=1e-5, rtol=1e-5)
+
+
+def test_rejects_unknown_spatial_attention_mode():
+    with pytest.raises(ValueError, match="spatial_attention_mode"):
+        make_projector(spatial_attention_mode="unknown")
+
 
 
 def test_prefix_uses_one_strictly_zero_initialized_shared_mask_token():
@@ -98,6 +115,44 @@ def test_full_state_and_phase_specific_repa_shapes():
     assert output.state.tokens.shape == (1, 2, 48, 30, 48)
     assert output.repa_reference.anchor.shape == (1, 1, 30, 48, 8)
     assert output.repa_reference.video_phases.shape == (1, 1, 2, 30, 48, 8)
+
+def test_attention_modes_preserve_state_repa_and_prefix_contracts():
+    torch.manual_seed(11)
+    causal = make_projector(spatial_attention_mode="set_causal")
+    full = make_projector(spatial_attention_mode="full")
+    full.load_state_dict(causal.state_dict())
+    anchor = torch.randn(1, 1, 30, 48, 8)
+    video = torch.randn(1, 2, 30, 48, 8)
+    features = PrefixEncoderOutput(
+        groups=(
+            make_features(anchor).groups[0],
+            PrefixGroupFeatures(
+                tokens=video,
+                layer_tokens=tuple(video.clone() for _ in range(5)),
+                latent_type="video_group",
+                source_start=0,
+                source_end=4,
+                input_frames=6,
+            ),
+        ),
+        spatial_grid=(30, 48),
+        embed_dim=8,
+        max_context_frames=64,
+    )
+
+    causal_output = causal(features)
+    full_output = full(features)
+    assert full_output.state.tokens.shape == causal_output.state.tokens.shape
+    assert full_output.repa_reference.anchor.shape == causal_output.repa_reference.anchor.shape
+    assert (
+        full_output.repa_reference.video_phases.shape
+        == causal_output.repa_reference.video_phases.shape
+    )
+    assert full_output.state.contract == causal_output.state.contract
+    assert full.make_prefix_view(full_output.state, 12).tokens.shape == (
+        causal.make_prefix_view(causal_output.state, 12).tokens.shape
+    )
+
 
 
 def test_candidate_v3_contract_binds_fixed_prefix_indexing_and_layout_checksum():
