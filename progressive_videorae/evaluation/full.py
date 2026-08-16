@@ -41,6 +41,7 @@ RECONSTRUCTION_METRICS = (
     "rgb_ssim",
     "rgb_lpips",
     "temporal_difference_l1",
+    "temporal_difference_l1_per_second",
     "vjepa_local_cosine",
     "vjepa_global_cosine",
     "out_of_range_fraction",
@@ -316,8 +317,14 @@ def validate_evaluation_config(
             f"{purpose} does not allow RGB/state geometry "
             f"{rgb_frames} frames/{latent_frames} latents"
         )
-    if float(data_config["target_fps"]) != 12.0:
-        raise ValueError("The formal full_480p protocol requires target_fps=12")
+    target_fps = float(data_config["target_fps"])
+    if target_fps not in (12.0, 24.0):
+        raise ValueError("Formal full_480p evaluation supports target_fps=12 or 24")
+    model_fps = float(
+        model_config.get("video", {}).get("target_fps", target_fps)
+    )
+    if abs(model_fps - target_fps) > 1.0e-9:
+        raise ValueError("Evaluation model and data target_fps must match")
     if (int(data_config["height"]), int(data_config["width"])) != (480, 768):
         raise ValueError("The formal full_480p protocol requires 480x768 RGB clips")
     expected_state = {
@@ -364,6 +371,7 @@ def load_ranked_records(
     num_frames: int,
     target_fps: float,
     sampling_seed: int,
+    min_native_fps_ratio: float = 0.0,
 ) -> list[dict[str, Any]]:
     try:
         import pandas as pd
@@ -378,6 +386,14 @@ def load_ranked_records(
     if "duration" in frame:
         duration = frame["duration"]
         frame = frame[duration.isna() | (duration >= minimum_duration - 1e-6)]
+    if min_native_fps_ratio > 0.0:
+        if "native_fps" not in frame:
+            raise ValueError("Evaluation manifest native_fps is required")
+        native = pd.to_numeric(frame["native_fps"], errors="coerce")
+        frame = frame[
+            native.notna()
+            & (native + 1.0e-9 >= target_fps * min_native_fps_ratio)
+        ]
     records = frame.to_dict("records")
     sample_ids = [str(row["sample_id"]) for row in records]
     if len(sample_ids) != len(set(sample_ids)):
@@ -400,6 +416,7 @@ class ExactEvaluationDataset(Dataset):
         height: int,
         width: int,
         benchmark_mode: bool = False,
+        min_native_fps_ratio: float = 0.0,
     ) -> None:
         self.records = records
         self.benchmark_mode = benchmark_mode
@@ -410,6 +427,7 @@ class ExactEvaluationDataset(Dataset):
             width=width,
             split="test",
             horizontal_flip=False,
+            min_native_fps_ratio=min_native_fps_ratio,
         )
 
     def __len__(self) -> int:

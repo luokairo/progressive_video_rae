@@ -10,15 +10,17 @@ from torch import nn
 from ..model.model import ProgressiveVideoRAE
 
 
-STAGES = ("stage1a", "stage1b", "stage2a", "stage2b")
+STAGES = ("stage1a", "stage1a_plus", "stage1b", "stage2a", "stage2b")
 OBJECTIVE_MODES = {
     "stage1a": "full_repa",
+    "stage1a_plus": "cross_clip_cache_reconstruction",
     "stage1b": "nested_spectral_hrepa_full_anchor",
     "stage2a": "full_repa",
     "stage2b": "full_repa_stateful",
 }
 STAGE_GEOMETRY = {
     "stage1a": (17, 5),
+    "stage1a_plus": (33, 9),
     "stage1b": (17, 5),
     "stage2a": (17, 5),
     "stage2b": (33, 9),
@@ -78,7 +80,7 @@ def validate_stage_objective(config: dict) -> str:
     expected = OBJECTIVE_MODES[stage]
     if config.get("objective_mode") != expected:
         raise ValueError(f"{stage} requires objective_mode={expected}")
-    if stage in ("stage2a", "stage2b"):
+    if stage in ("stage1a_plus", "stage2a", "stage2b"):
         forbidden = sorted(
             key
             for key in config
@@ -93,6 +95,20 @@ def validate_stage_objective(config: dict) -> str:
                 f"{stage} forbids prefix/DCT/mask-replacement configuration: "
                 f"{forbidden}"
             )
+    if stage == "stage1a_plus":
+        required = {
+            "gradient_accumulation_steps": 4,
+            "global_batch_size": 32,
+            "adversarial_weight": 0.0,
+            "repa_max_factor": 0.0,
+        }
+        mismatches = {
+            key: (config.get(key), value)
+            for key, value in required.items()
+            if config.get(key) != value
+        }
+        if mismatches:
+            raise ValueError(f"stage1a_plus configuration mismatch: {mismatches}")
     if stage == "stage1b":
         if config.get("prefix_schedule") != STAGE1B_PREFIX_SCHEDULE:
             raise ValueError(f"stage1b requires prefix_schedule={STAGE1B_PREFIX_SCHEDULE}")
@@ -166,10 +182,27 @@ def validate_training_bundle(
     state = model_config["state"]
     encoder = model_config["encoder"]
     decoder = model_config["decoder"]
-    if int(video.get("num_frames", -1)) != expected_frames:
-        raise ValueError(f"model.video.num_frames must be {expected_frames} for {stage}")
-    if int(state.get("num_frames", -1)) != expected_latents:
-        raise ValueError(f"model.state.num_frames must be {expected_latents} for {stage}")
+    data_fps = float(data_config.get("target_fps", 0.0))
+    model_fps = float(video.get("target_fps", 0.0))
+    if data_fps <= 0.0 or model_fps <= 0.0:
+        raise ValueError(
+            "model.video.target_fps and data.target_fps must be positive"
+        )
+    if abs(data_fps - model_fps) > 1.0e-9:
+        raise ValueError(
+            f"model.video.target_fps={model_fps} does not match "
+            f"data.target_fps={data_fps}"
+        )
+    ratio = float(data_config.get("min_native_fps_ratio", 0.0))
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("data.min_native_fps_ratio must be in [0,1]")
+    model_frames, model_latents = (17, 5) if stage == "stage1a_plus" else (
+        expected_frames, expected_latents
+    )
+    if int(video.get("num_frames", -1)) != model_frames:
+        raise ValueError(f"model.video.num_frames must be {model_frames} for {stage}")
+    if int(state.get("num_frames", -1)) != model_latents:
+        raise ValueError(f"model.state.num_frames must be {model_latents} for {stage}")
 
     data_hw = (int(data_config["height"]), int(data_config["width"]))
     configured_sizes = {
@@ -272,22 +305,25 @@ def configure_stage(
     optimizer_step: int = 0,
     wan_interface_step: int = 2000,
     wan_full_step: int = 5000,
+    repa_trainable: bool = True,
 ) -> None:
     if stage not in STAGES:
         raise ValueError(f"Unsupported stage {stage}; expected one of {STAGES}")
     _set_trainable(model.encoder, False)
     if stage == "stage1a":
         _set_trainable(model.projector, True)
-        _set_trainable(model.repa_projection, True)
+        _set_trainable(model.repa_projection, repa_trainable)
         model.projector.shared_mask_set.requires_grad_(False)
-    elif stage == "stage1b":
+    elif stage in ("stage1a_plus", "stage1b"):
         _set_trainable(model.projector, True)
         _set_trainable(model.repa_projection, False)
+        if stage == "stage1a_plus":
+            model.projector.shared_mask_set.requires_grad_(False)
     else:
         _set_trainable(model.projector, False)
         _set_trainable(model.repa_projection, False)
 
-    if stage == "stage1b":
+    if stage in ("stage1a_plus", "stage1b"):
         _configure_temporal_interface(model.decoder, pre_decoder=True)
         return
     if stage != "stage1a":
@@ -312,7 +348,7 @@ def sample_microbatch_tasks(
     *,
     optimizer_step: int = 0,
 ) -> tuple[MicrobatchTask, ...]:
-    if stage in ("stage1a", "stage2a", "stage2b"):
+    if stage in ("stage1a", "stage1a_plus", "stage2a", "stage2b"):
         return tuple(MicrobatchTask("full") for _ in range(accumulation_steps))
     if stage != "stage1b":
         raise ValueError(f"Unsupported stage: {stage}")
@@ -334,3 +370,27 @@ def adversarial_factor(optimizer_step: int, start_step: int, ramp_steps: int) ->
     if ramp_steps == 0:
         return 1.0
     return min(1.0, max(0.0, (optimizer_step - start_step) / ramp_steps))
+
+
+def repa_factor(
+    optimizer_step: int,
+    start_step: int = 0,
+    ramp_steps: int = 0,
+    max_factor: float = 1.0,
+) -> float:
+    """Return the effective full-state REPA multiplier for one optimizer step."""
+
+    if optimizer_step < 0:
+        raise ValueError("REPA optimizer step must be non-negative")
+    if start_step < 0 or ramp_steps < 0:
+        raise ValueError("REPA start and ramp steps must be non-negative")
+    if max_factor < 0.0:
+        raise ValueError("REPA max factor must be non-negative")
+    if optimizer_step < start_step:
+        return 0.0
+    if ramp_steps == 0:
+        return float(max_factor)
+    progress = min(
+        1.0, max(0.0, (optimizer_step - start_step) / ramp_steps)
+    )
+    return float(max_factor) * progress

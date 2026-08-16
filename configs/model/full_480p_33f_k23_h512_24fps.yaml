@@ -1,8 +1,8 @@
 video:
-  num_frames: 17
+  num_frames: 33
   target_height: 480
   target_width: 768
-  target_fps: 12.0
+  target_fps: 24.0
 
 encoder:
   name: vjepa2
@@ -20,7 +20,7 @@ encoder:
   handle_nonsquare_inputs: true
 
 state:
-  num_frames: 5
+  num_frames: 9
   height: 30
   width: 48
   channels: 48

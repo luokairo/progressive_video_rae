@@ -11,6 +11,7 @@ from .projector import CausalFrequencyProjector
 from .types import (
     PrefixEncoderOutput,
     ProgressiveState,
+    ProgressiveStateChunk,
     RepaReference,
     SpatialPrefixView,
     assert_video_tensor,
@@ -29,6 +30,15 @@ class ProgressiveVideoRAEOutput:
     decoder_output: WanDecoderOutput
     repa_features: RepaReference | None = None
     repa_reference: RepaReference | None = None
+
+@dataclass
+class ProgressiveVideoRAEChunkOutput:
+    reconstruction: Tensor
+    target: Tensor
+    state_chunk: ProgressiveStateChunk
+    encoder_output: PrefixEncoderOutput
+    decoder_output: WanDecoderOutput
+
 
 
 class PhaseSpecificRepaProjection(nn.Module):
@@ -141,6 +151,73 @@ class ProgressiveVideoRAE(nn.Module):
         projected = self.projector(encoder_output)
         return encoder_output, projected
 
+    def encode_chunk(
+        self,
+        pixel_values: Tensor,
+        *,
+        sequence_id: str,
+        latent_start: int,
+        is_sequence_start: bool,
+        target_fps: float,
+        start_timestamp: float,
+    ) -> tuple[PrefixEncoderOutput, ProgressiveStateChunk]:
+        encoder_output, projected = self.encode(pixel_values)
+        state = projected.state
+        if not is_sequence_start:
+            if state.tokens.shape[1] <= 1 or state.latent_types is None:
+                raise ValueError("Continuation window must provide anchor plus video latents")
+            state = ProgressiveState(
+                tokens=state.tokens[:, 1:],
+                layout_version=state.layout_version,
+                layout_checksum=state.layout_checksum,
+                latent_types=state.latent_types[1:],
+                contract=state.contract,
+            )
+        return encoder_output, ProgressiveStateChunk(
+            state=state,
+            sequence_id=sequence_id,
+            latent_start=latent_start,
+            is_sequence_start=is_sequence_start,
+            target_fps=target_fps,
+            start_timestamp=start_timestamp,
+        )
+
+    def _forward_chunk(
+        self,
+        pixel_values: Tensor,
+        *,
+        sequence_id: str,
+        latent_start: int,
+        is_sequence_start: bool,
+        target_fps: float,
+        start_timestamp: float,
+        cache_state: WanCacheState | None,
+    ) -> ProgressiveVideoRAEChunkOutput:
+        encoder_output, chunk = self.encode_chunk(
+            pixel_values,
+            sequence_id=sequence_id,
+            latent_start=latent_start,
+            is_sequence_start=is_sequence_start,
+            target_fps=target_fps,
+            start_timestamp=start_timestamp,
+        )
+        decoder_output = self.decoder.decode_chunk(chunk, cache_state=cache_state)
+        target_pixels = pixel_values if is_sequence_start else pixel_values[:, :, 1:]
+        target = target_pixels.mul(2.0).sub(1.0)
+        if decoder_output.video.shape != target.shape:
+            raise RuntimeError(
+                "Chunk reconstruction shape mismatch: "
+                f"{tuple(decoder_output.video.shape)} vs {tuple(target.shape)}"
+            )
+        return ProgressiveVideoRAEChunkOutput(
+            reconstruction=decoder_output.video,
+            target=target,
+            state_chunk=chunk,
+            encoder_output=encoder_output,
+            decoder_output=decoder_output,
+        )
+
+
     def forward(
         self,
         pixel_values: Tensor,
@@ -151,7 +228,34 @@ class ProgressiveVideoRAE(nn.Module):
         cache_state: WanCacheState | None = None,
         return_decoder_features: bool = False,
         sequence_id: str | None = None,
-    ) -> ProgressiveVideoRAEOutput | tuple[ProgressiveVideoRAEOutput, ProgressiveVideoRAEOutput]:
+        chunk_latent_start: int | None = None,
+        chunk_is_sequence_start: bool | None = None,
+        chunk_target_fps: float | None = None,
+        chunk_start_timestamp: float | None = None,
+    ) -> (
+        ProgressiveVideoRAEOutput
+        | ProgressiveVideoRAEChunkOutput
+        | tuple[ProgressiveVideoRAEOutput, ProgressiveVideoRAEOutput]
+    ):
+        if chunk_latent_start is not None:
+            if (
+                sequence_id is None
+                or chunk_is_sequence_start is None
+                or chunk_target_fps is None
+                or chunk_start_timestamp is None
+            ):
+                raise ValueError("Chunk forward requires complete sequence metadata")
+            if endpoint is not None or paired_previous_endpoint is not None:
+                raise ValueError("Chunk forward cannot execute a spatial-prefix task")
+            return self._forward_chunk(
+                pixel_values,
+                sequence_id=sequence_id,
+                latent_start=chunk_latent_start,
+                is_sequence_start=chunk_is_sequence_start,
+                target_fps=chunk_target_fps,
+                start_timestamp=chunk_start_timestamp,
+                cache_state=cache_state,
+            )
         encoder_output = self.encode_features(pixel_values)
         if paired_previous_endpoint is not None:
             if endpoint is None or paired_previous_endpoint != endpoint - 1:

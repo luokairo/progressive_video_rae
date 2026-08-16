@@ -1,0 +1,50 @@
+model_config: configs/model/full_480p_k23_h512_24fps.yaml
+data_config: configs/data/default_17f_24fps.yaml
+stage: stage1b
+objective_mode: nested_spectral_hrepa_full_anchor
+max_steps: 90000
+global_batch_size: 64
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+precision: bf16
+gradient_checkpointing: true
+fused_optimizer: true
+projector_lr: 1.0e-4
+wan_temporal_lr: 2.0e-5
+wan_spatial_lr: 5.0e-6
+discriminator_lr: 5.0e-5
+weight_decay: 0.05
+warmup_steps: 2000
+gradient_clip: 1.0
+prefix_schedule: fixed_7_prefix_1_p47_full
+prefix_min: 0
+prefix_max: 46
+prefix_objective_weight: 1.0
+p47_objective_weight: 1.0
+prefix_lpips_weight: 0.5
+p47_full_microbatches_per_step: 1
+prefix_repa_schedule: fixed_6level_spatial_pyramid
+prefix_repa_levels:
+  - [1, 1]
+  - [2, 3]
+  - [4, 6]
+  - [8, 12]
+  - [15, 24]
+  - [30, 48]
+prefix_repa_global_weight: 1.0
+prefix_repa_local_weight: 1.0
+decoder_trainable_policy: temporal_interface
+l1_weight: 1.0
+lpips_weight: 1.0
+temporal_l1_weight: 0.1
+repa_local_weight: 1.0
+repa_global_weight: 1.0
+band_weight: 1.0
+leakage_weight: 0.1
+adversarial_weight: 0.05
+disc_start: 0
+adversarial_ramp_steps: 1000
+checkpoint_root: /share/project/liujingyi/ckpts/progressive_video_rae/training
+log_dir: /share/project/liujingyi/logs/waverae/progressive_video_rae
+save_every: 1000
+log_every: 10

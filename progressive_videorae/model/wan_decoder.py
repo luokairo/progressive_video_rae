@@ -16,6 +16,7 @@ from .types import (
     IMAGE_FIRST_ID,
     VIDEO_GROUP_ID,
     ProgressiveState,
+    ProgressiveStateChunk,
     SpatialPrefixView,
     StateContract,
 )
@@ -126,6 +127,8 @@ class WanCacheState:
     codec_id: str | None = None
     decoder_id: str | None = None
     batch_size: int | None = None
+    next_latent_offset: int = 0
+    target_fps: float | None = None
     dtype: torch.dtype | None = None
     device: torch.device | None = None
 
@@ -343,7 +346,7 @@ class WanVideoDecoder(nn.Module):
         return self.pre_decoder(latent)
 
     @staticmethod
-    def _detach_cache(cache_state: WanCacheState) -> None:
+    def detached_cache_state(cache_state: WanCacheState) -> WanCacheState:
         def detach(value: Any) -> Any:
             if isinstance(value, Tensor):
                 return value.detach()
@@ -355,9 +358,31 @@ class WanVideoDecoder(nn.Module):
                 return {key: detach(item) for key, item in value.items()}
             return value
 
-        cache_state.features = detach(cache_state.features)
-        if cache_state.rae is not None and cache_state.rae.raw_history is not None:
-            cache_state.rae.raw_history = cache_state.rae.raw_history.detach()
+        raw_history = (
+            None
+            if cache_state.rae is None or cache_state.rae.raw_history is None
+            else cache_state.rae.raw_history.detach()
+        )
+        return WanCacheState(
+            features=detach(cache_state.features),
+            latents_seen=cache_state.latents_seen,
+            rae=RAETemporalCache(raw_history=raw_history),
+            sequence_id=cache_state.sequence_id,
+            state_contract=cache_state.state_contract,
+            codec_id=cache_state.codec_id,
+            decoder_id=cache_state.decoder_id,
+            batch_size=cache_state.batch_size,
+            dtype=cache_state.dtype,
+            device=cache_state.device,
+            next_latent_offset=cache_state.next_latent_offset,
+            target_fps=cache_state.target_fps,
+        )
+
+    @classmethod
+    def _detach_cache(cls, cache_state: WanCacheState) -> None:
+        detached = cls.detached_cache_state(cache_state)
+        cache_state.features = detached.features
+        cache_state.rae = detached.rae
 
     @staticmethod
     def _validate_latent_types(latent_types: Tensor, *, cache_mode: CacheMode) -> None:
@@ -378,6 +403,40 @@ class WanVideoDecoder(nn.Module):
                 f"cache_mode='{cache_mode}' accepts video_group latents only after image_first"
             )
 
+
+    def decode_chunk(
+        self,
+        chunk: ProgressiveStateChunk,
+        *,
+        cache_state: WanCacheState | None = None,
+        return_features: bool = False,
+    ) -> WanDecoderOutput:
+        mode: CacheMode = "reset" if chunk.is_sequence_start else "reuse"
+        if chunk.is_sequence_start:
+            if cache_state is not None:
+                raise ValueError("Sequence-start chunk cannot reuse an existing cache")
+        else:
+            if cache_state is None:
+                raise ValueError("Continuation chunk requires a cache_state")
+            if cache_state.next_latent_offset != chunk.latent_start:
+                raise ValueError(
+                    "Continuation latent offset mismatch: "
+                    f"expected {cache_state.next_latent_offset}, got {chunk.latent_start}"
+                )
+            if cache_state.target_fps != chunk.target_fps:
+                raise ValueError("Continuation target_fps does not match cache_state")
+        output = self.decode(
+            chunk.state,
+            cache_mode=mode,
+            cache_state=cache_state,
+            sequence_id=chunk.sequence_id,
+            return_features=return_features,
+        )
+        if output.cache_state is None:
+            raise RuntimeError("Stateful chunk decode returned no cache")
+        output.cache_state.next_latent_offset = chunk.latent_end
+        output.cache_state.target_fps = chunk.target_fps
+        return output
     def decode(
         self,
         state: ProgressiveState | SpatialPrefixView | Tensor,

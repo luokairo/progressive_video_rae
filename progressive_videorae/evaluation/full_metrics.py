@@ -112,8 +112,11 @@ class EvaluationLPIPS(nn.Module):
 
 
 class FullReconstructionMetricSuite(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, target_fps: float = 12.0) -> None:
         super().__init__()
+        if target_fps <= 0.0:
+            raise ValueError("target_fps must be positive")
+        self.target_fps = float(target_fps)
         self.lpips = EvaluationLPIPS()
 
     @torch.no_grad()
@@ -127,6 +130,9 @@ class FullReconstructionMetricSuite(nn.Module):
             "rgb_lpips": float(self.lpips(prediction, target).cpu()),
             "temporal_difference_l1": float(
                 temporal_difference_l1(prediction, target).cpu()
+            ),
+            "temporal_difference_l1_per_second": float(
+                temporal_difference_l1(prediction, target).cpu() * self.target_fps
             ),
             **output_range_statistics(prediction_raw),
         }

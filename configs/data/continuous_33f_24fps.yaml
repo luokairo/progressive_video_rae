@@ -1,0 +1,13 @@
+csv_spec: /share/project/liujingyi/progressive_video_rae/data/data_csv.md
+manifest_dir: /share/project/liujingyi/progressive_video_rae/data/manifests
+split_seed: 20260807
+split_ratios: [0.95, 0.025, 0.025]
+num_frames: 33
+target_fps: 24.0
+min_native_fps_ratio: 0.999
+height: 480
+width: 768
+train_random_crop: true
+train_horizontal_flip: true
+decode_backend: pyav
+num_workers: 8

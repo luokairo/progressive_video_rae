@@ -139,6 +139,42 @@ class ProgressiveState:
             raise ValueError("ProgressiveState must carry a StateContract")
         return self.contract.num_sets - 1
 
+@dataclass(frozen=True)
+class ProgressiveStateChunk:
+    """Sequence-aware state chunk for cached decoding and future NOVA consumers."""
+
+    state: ProgressiveState
+    sequence_id: str
+    latent_start: int
+    is_sequence_start: bool
+    target_fps: float
+    start_timestamp: float
+
+    def __post_init__(self) -> None:
+        if not self.sequence_id.strip():
+            raise ValueError("ProgressiveStateChunk sequence_id must be non-empty")
+        if self.latent_start < 0:
+            raise ValueError("ProgressiveStateChunk latent_start must be non-negative")
+        if self.target_fps <= 0.0:
+            raise ValueError("ProgressiveStateChunk target_fps must be positive")
+        latent_types = self.state.latent_types
+        if latent_types is None or latent_types.numel() == 0:
+            raise ValueError("ProgressiveStateChunk requires explicit latent_types")
+        if self.is_sequence_start:
+            if self.latent_start != 0 or latent_types[0].item() != IMAGE_FIRST_ID:
+                raise ValueError("Sequence-start chunk must begin at latent 0 with image_first")
+        elif bool((latent_types != VIDEO_GROUP_ID).any()):
+            raise ValueError("Continuation chunk accepts video_group latents only")
+
+    @property
+    def latent_count(self) -> int:
+        return int(self.state.tokens.shape[1])
+
+    @property
+    def latent_end(self) -> int:
+        return self.latent_start + self.latent_count
+
+
 
 @dataclass
 class SpatialPrefixView:

@@ -350,7 +350,10 @@ class ProgressiveLosses(nn.Module):
         discriminator: nn.Module,
         *,
         adversarial_factor: float = 1.0,
+        repa_factor: float = 1.0,
     ) -> LossOutput:
+        if repa_factor < 0.0:
+            raise ValueError("REPA factor must be non-negative")
         l1 = F.l1_loss(output.reconstruction, output.target)
         perceptual = self._lpips(output.reconstruction, output.target)
         if output.repa_features is None:
@@ -410,8 +413,8 @@ class ProgressiveLosses(nn.Module):
             "l1": self.l1_weight * l1,
             "lpips": self.lpips_weight * perceptual,
             "temporal_l1": self.temporal_l1_weight * temporal,
-            "repa_local": self.repa_local_weight * local,
-            "repa_global": self.repa_global_weight * global_loss,
+            "repa_local": self.repa_local_weight * float(repa_factor) * local,
+            "repa_global": self.repa_global_weight * float(repa_factor) * global_loss,
             "adversarial": self.adversarial_weight * float(adversarial_factor) * adversarial,
         }
         statistics = {"repa/anchor_error": anchor_local}

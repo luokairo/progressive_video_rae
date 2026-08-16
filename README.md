@@ -60,6 +60,28 @@ torchrun --standalone --nproc_per_node=8 -m progressive_videorae.train \
   --config configs/train/stage1a.yaml
 ```
 
+### 当前 24 FPS 主链与门禁
+
+当前主链固定为 `Stage1-A 17帧 → Stage1-B 17帧 → Stage2-A 17帧 → Stage2-B 33帧`，
+所有阶段均使用 24 FPS；Stage1-A/Stage2-B 固定 `K23 + hidden512`。现有 12 FPS
+配置和历史结果继续保留，24 FPS 的 raw temporal L1 只与同 FPS 协议比较；跨 FPS
+比较使用 `temporal_difference_l1_per_second = raw × target_fps`。
+
+正式 Stage1-A 配置为
+`configs/train/stage1a_recon_k23_h512_24fps_12k.yaml`。正式 Stage1-A 必须
+fresh 启动，且必须先获得用户明确确认；任何短验证 checkpoint 都不能作为正式起点。
+
+后续主链使用 `configs/train/stage1b_24fps.yaml`、
+`configs/train/stage2a_24fps.yaml` 和 `configs/train/stage2b_24fps.yaml`；
+resume 不允许改变 FPS，跨阶段允许 17→33 帧但 FPS 必须保持 24。
+
+可选的 Stage1-A-plus 使用
+`configs/train/stage1a_plus_k23_h512_24fps_2k.yaml` 和独立入口
+`python -m progressive_videorae.train_stage1a_plus`。它只从完成的 Stage1-A
+checkpoint 初始化，处理重叠窗口 `0–16` 与 `16–32`，第二窗丢弃重复 anchor，
+复用并在边界 detach decoder cache。Plus 是旁路实验，不会初始化 Stage1-B，也不会被
+Stage1-A 自动启动；其短验证与 2000-step 正式运行都需要单独门禁。
+
 推荐阶段顺序：
 
 ```bash

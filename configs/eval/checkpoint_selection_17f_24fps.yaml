@@ -1,0 +1,18 @@
+purpose: checkpoint_selection
+model_config: configs/model/full_480p_k23_h512_24fps.yaml
+data_config: configs/data/default_17f_24fps.yaml
+split: val
+device: cuda
+batch_size: 1
+precision: bf16
+max_clips: 5000
+sampling_seed: 20260807
+save_videos: false
+save_video_limit: 0
+compute_fvd: false
+compute_vjepa: false
+compute_state_statistics: false
+check_cache_equivalence: false
+cache_check_samples: 0
+cache_split_patterns: [[1, 4]]
+cache_equivalence_atol: 1.0e-5

@@ -1,0 +1,50 @@
+model_config: configs/model/full_480p_vjepa2_last17.yaml
+data_config: configs/data/default_17f.yaml
+stage: stage1a
+objective_mode: full_repa
+max_steps: 200
+global_batch_size: 64
+micro_batch_size: 1
+gradient_accumulation_steps: 8
+precision: bf16
+gradient_checkpointing: true
+gradient_checkpointing_by_phase:
+  warmup: true
+  interface: true
+  full: true
+fused_optimizer: true
+verify_ddp_gradient_sync: false
+projector_lr: 1.0e-4
+wan_temporal_lr: 2.0e-5
+wan_spatial_lr: 5.0e-6
+discriminator_lr: 5.0e-5
+weight_decay: 0.0
+weight_decay_by_group:
+  rae_fast: 0.01
+  wan_temporal: 0.0
+  wan_spatial: 0.0
+warmup_steps: 50
+min_lr_ratio: 1.0
+gradient_clip: 1.0
+gradient_clip_by_group:
+  rae_fast: 5.0
+  wan_temporal: 5.0
+  wan_spatial: 10.0
+wan_interface_step: 0
+wan_full_step: 0
+l1_weight: 1.0
+lpips_weight: 1.0
+temporal_l1_weight: 0.1
+repa_local_weight: 1.0
+repa_global_weight: 1.0
+repa_start_step: 0
+repa_ramp_steps: 0
+repa_max_factor: 0.0
+adversarial_weight: 0.0
+disc_start: 200
+adversarial_ramp_steps: 0
+checkpoint_root: /share/project/liujingyi/ckpts/progressive_video_rae/stage1a_ablation
+log_dir: /share/project/liujingyi/logs/waverae/stage1a_ablation
+save_every: 200
+save_at_steps: [100]
+log_every: 10

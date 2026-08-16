@@ -14,7 +14,7 @@ encoder:
   patch_size: 16
   tubelet_size: 2
   max_context_frames: 64
-  output_layers: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24]
+  output_layers: [12, 14, 16, 18, 20, 22, 24]
   embed_dim: 1024
   freeze: true
   handle_nonsquare_inputs: true

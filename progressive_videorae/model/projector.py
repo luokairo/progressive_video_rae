@@ -17,6 +17,90 @@ from .types import (
 )
 
 
+class IdentityInitializedTemporalAttentionPool(nn.Module):
+    """Pool one same-spatial temporal group with a normalized mean at init."""
+
+    def __init__(
+        self,
+        dim: int,
+        *,
+        group_size: int = 2,
+        num_heads: int = 16,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.group_size = int(group_size)
+        self.num_heads = int(num_heads)
+        if self.group_size <= 0:
+            raise ValueError("Temporal pooling group_size must be positive")
+        if self.num_heads <= 0 or self.dim % self.num_heads:
+            raise ValueError(
+                f"Temporal pooling dim={self.dim} must be divisible by "
+                f"num_heads={self.num_heads}"
+            )
+        self.head_dim = self.dim // self.num_heads
+        self.scale = self.head_dim**-0.5
+
+        self.norm_k = nn.LayerNorm(self.dim)
+        self.query = nn.Parameter(torch.zeros(1, self.num_heads, 1, self.head_dim))
+        self.key = nn.Linear(self.dim, self.dim)
+        self.value = nn.Linear(self.dim, self.dim)
+        self.proj = nn.Linear(self.dim, self.dim)
+        self.time_bias = nn.Parameter(torch.zeros(self.num_heads, self.group_size))
+        self.norm_out = nn.LayerNorm(self.dim, elementwise_affine=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.ones_(self.norm_k.weight)
+        nn.init.zeros_(self.norm_k.bias)
+        nn.init.zeros_(self.query)
+        for layer in (self.key, self.value, self.proj):
+            nn.init.eye_(layer.weight)
+            nn.init.zeros_(layer.bias)
+        nn.init.zeros_(self.time_bias)
+
+    def forward(
+        self,
+        x: Tensor,
+        *,
+        return_attention: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
+        if x.ndim != 5:
+            raise ValueError(f"Expected temporal features [B,P,H,W,C], got {tuple(x.shape)}")
+        batch, group_size, height, width, channels = x.shape
+        if group_size != self.group_size or channels != self.dim:
+            raise ValueError(
+                "Temporal pooling shape mismatch: "
+                f"expected P={self.group_size}, C={self.dim}; "
+                f"got P={group_size}, C={channels}"
+            )
+
+        grouped = x.permute(0, 2, 3, 1, 4).reshape(
+            batch * height * width, group_size, channels
+        )
+        locations = grouped.shape[0]
+        key = self.key(self.norm_k(grouped)).reshape(
+            locations, group_size, self.num_heads, self.head_dim
+        )
+        value = self.value(grouped).reshape(
+            locations, group_size, self.num_heads, self.head_dim
+        )
+        key = key.permute(0, 2, 1, 3)
+        value = value.permute(0, 2, 1, 3)
+        query = self.query.expand(locations, -1, -1, -1)
+        logits = (query * key).sum(dim=-1) * self.scale
+        logits = logits + self.time_bias.to(device=logits.device, dtype=logits.dtype)[None]
+        attention = logits.softmax(dim=-1)
+        pooled = (attention.unsqueeze(-1) * value).sum(dim=2).reshape(locations, channels)
+        pooled = self.norm_out(self.proj(pooled))
+        pooled = pooled.reshape(batch, height, width, channels)
+        if not return_attention:
+            return pooled
+        return pooled, attention.reshape(
+            batch, height, width, self.num_heads, group_size
+        )
+
+
 class CausalFrequencyProjector(nn.Module):
     """Map native V-JEPA prefix features to the v3 progressive state."""
 
@@ -37,6 +121,10 @@ class CausalFrequencyProjector(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         spatial_attention_mode: str = "set_causal",
+        layer_fusion: str = "learned_softmax",
+        layer_fusion_norm: str = "none",
+        temporal_pooling: str = "hidden_dim_attention",
+        temporal_pooling_heads: int = 16,
         layout_version: str = LAYOUT_VERSION,
         set_sizes: tuple[int, ...] = SET_SIZES,
     ) -> None:
@@ -51,6 +139,21 @@ class CausalFrequencyProjector(nn.Module):
                 "spatial_attention_mode must be 'set_causal' or 'full', "
                 f"got {spatial_attention_mode!r}"
             )
+        if layer_fusion not in ("learned_softmax", "fixed_sum"):
+            raise ValueError(
+                "layer_fusion must be 'learned_softmax' or 'fixed_sum', "
+                f"got {layer_fusion!r}"
+            )
+        if layer_fusion_norm not in ("none", "non_affine_layer_norm"):
+            raise ValueError(
+                "layer_fusion_norm must be 'none' or 'non_affine_layer_norm', "
+                f"got {layer_fusion_norm!r}"
+            )
+        if temporal_pooling not in ("hidden_dim_attention", "input_dim_attention"):
+            raise ValueError(
+                "temporal_pooling must be 'hidden_dim_attention' or "
+                f"'input_dim_attention', got {temporal_pooling!r}"
+            )
         self.num_input_layers = int(num_input_layers)
         self.max_context_frames = int(max_context_frames)
         self.height = int(height)
@@ -58,6 +161,10 @@ class CausalFrequencyProjector(nn.Module):
         self.hidden_dim = int(hidden_dim)
         self.output_dim = int(output_dim)
         self.spatial_attention_mode = spatial_attention_mode
+        self.layer_fusion = layer_fusion
+        self.layer_fusion_norm_mode = layer_fusion_norm
+        self.temporal_pooling = temporal_pooling
+        self.temporal_pooling_heads = int(temporal_pooling_heads)
 
         layout = build_progressive_layout(height, width, set_sizes, layout_version)
         self.layout_version = layout.version
@@ -90,15 +197,27 @@ class CausalFrequencyProjector(nn.Module):
             layout_checksum=layout.checksum,
         )
 
-        self.layer_mix_logits = nn.Parameter(torch.zeros(num_input_layers))
+        if self.layer_fusion == "learned_softmax":
+            self.layer_mix_logits = nn.Parameter(torch.zeros(num_input_layers))
+        if self.layer_fusion_norm_mode == "non_affine_layer_norm":
+            self.layer_fusion_norm = nn.LayerNorm(input_dim, elementwise_affine=False)
+        else:
+            self.layer_fusion_norm = nn.Identity()
         self.first_projection = nn.Linear(input_dim, hidden_dim)
         self.video_projection = nn.Linear(input_dim, hidden_dim)
-        self.video_phase_embedding = nn.Parameter(torch.zeros(2, hidden_dim))
-        self.video_query = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        self.video_pair_norm = nn.LayerNorm(hidden_dim)
-        self.video_pair_attention = nn.MultiheadAttention(
-            hidden_dim, num_heads, dropout=dropout, batch_first=True
-        )
+        if self.temporal_pooling == "hidden_dim_attention":
+            self.video_phase_embedding = nn.Parameter(torch.zeros(2, hidden_dim))
+            self.video_query = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            self.video_pair_norm = nn.LayerNorm(hidden_dim)
+            self.video_pair_attention = nn.MultiheadAttention(
+                hidden_dim, num_heads, dropout=dropout, batch_first=True
+            )
+        else:
+            self.video_temporal_pool = IdentityInitializedTemporalAttentionPool(
+                input_dim,
+                group_size=2,
+                num_heads=self.temporal_pooling_heads,
+            )
         self.spatial_embedding = nn.Parameter(torch.zeros(1, height * width, hidden_dim))
         self.set_embedding = nn.Embedding(48, hidden_dim)
         self.type_embedding = nn.Embedding(2, hidden_dim)
@@ -120,15 +239,21 @@ class CausalFrequencyProjector(nn.Module):
 
         nn.init.trunc_normal_(self.spatial_embedding, std=0.02)
         nn.init.trunc_normal_(self.type_embedding.weight, std=0.02)
-        nn.init.trunc_normal_(self.video_phase_embedding, std=0.02)
-        nn.init.trunc_normal_(self.video_query, std=0.02)
+        if self.temporal_pooling == "hidden_dim_attention":
+            nn.init.trunc_normal_(self.video_phase_embedding, std=0.02)
+            nn.init.trunc_normal_(self.video_query, std=0.02)
 
     def _mix_layers(self, group: PrefixGroupFeatures) -> Tensor:
         layers = group.layer_tokens or (group.tokens,)
         if len(layers) != self.num_input_layers:
             raise ValueError(f"Expected {self.num_input_layers} V-JEPA layers, got {len(layers)}")
-        weights = self.layer_mix_logits.softmax(dim=0).to(layers[0])
-        return (torch.stack(layers) * weights.view(-1, 1, 1, 1, 1, 1)).sum(dim=0)
+        stacked = torch.stack(layers)
+        if self.layer_fusion == "learned_softmax":
+            weights = self.layer_mix_logits.softmax(dim=0).to(layers[0])
+            mixed = (stacked * weights.view(-1, 1, 1, 1, 1, 1)).sum(dim=0)
+        else:
+            mixed = stacked.sum(dim=0)
+        return self.layer_fusion_norm(mixed)
 
     def _reduce_group(self, group: PrefixGroupFeatures, mixed: Tensor) -> tuple[Tensor, int]:
         if group.latent_type == "image_first":
@@ -137,6 +262,9 @@ class CausalFrequencyProjector(nn.Module):
             return self.first_projection(mixed[:, 0]), IMAGE_FIRST_ID
         if group.latent_type != "video_group" or mixed.shape[1] != 2:
             raise ValueError("video_group must contain two selected tubelets")
+
+        if self.temporal_pooling == "input_dim_attention":
+            return self.video_projection(self.video_temporal_pool(mixed)), VIDEO_GROUP_ID
 
         x = self.video_projection(mixed)
         b, pair, h, w, c = x.shape

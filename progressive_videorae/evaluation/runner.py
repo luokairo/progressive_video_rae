@@ -394,6 +394,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             num_frames=int(data_config["num_frames"]),
             target_fps=float(data_config["target_fps"]),
             sampling_seed=int(evaluation["sampling_seed"]),
+            min_native_fps_ratio=float(data_config.get("min_native_fps_ratio", 0.0)),
         )
     if len(records) < evaluation["max_clips"]:
         raise RuntimeError(f"Only {len(records)} valid manifest rows are available")
@@ -526,6 +527,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             height=int(data_config["height"]),
             width=int(data_config["width"]),
             benchmark_mode=benchmark_mode,
+            min_native_fps_ratio=float(data_config.get("min_native_fps_ratio", 0.0)),
         )
         loader = DataLoader(
             dataset,
@@ -536,7 +538,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             persistent_workers=int(data_config["num_workers"]) > 0,
             collate_fn=collate_exact_evaluation,
         )
-        metric_suite = FullReconstructionMetricSuite().to(device).eval()
+        metric_suite = FullReconstructionMetricSuite(
+            target_fps=float(data_config["target_fps"])
+        ).to(device).eval()
 
         sample_records, failures = _load_progress(output_dir)
         strict_manifest_mode = benchmark_mode or selection_mode

@@ -17,9 +17,10 @@ UPSTREAM_COMMITS = {
     "vjepa2": "204698b45b3712590f06245fbfba32d3be539812",
     "wan2.2": "42bf4cfaa384bc21833865abc2f9e6c0e67233dc",
 }
-PREVIOUS_STAGE = {"stage1b": "stage1a", "stage2a": "stage1b", "stage2b": "stage2a"}
+PREVIOUS_STAGE = {"stage1a_plus": "stage1a", "stage1b": "stage1a", "stage2a": "stage1b", "stage2b": "stage2a"}
 OBJECTIVE_BY_STAGE = {
     "stage1a": "full_repa",
+    "stage1a_plus": "cross_clip_cache_reconstruction",
     "stage1b": "nested_spectral_hrepa_full_anchor",
     "stage2a": "full_repa",
     "stage2b": "full_repa_stateful",
@@ -134,6 +135,19 @@ def representation_identity(
         "codec_id": module.decoder.codec_id,
         "decoder_id": module.decoder.decoder_id,
     }
+    projector = module.projector
+    projector_modes = (
+        getattr(projector, "layer_fusion", "learned_softmax"),
+        getattr(projector, "layer_fusion_norm_mode", "none"),
+        getattr(projector, "temporal_pooling", "hidden_dim_attention"),
+    )
+    if projector_modes != ("learned_softmax", "none", "hidden_dim_attention"):
+        identity.update(
+            layer_fusion=projector_modes[0],
+            layer_fusion_norm=projector_modes[1],
+            temporal_pooling=projector_modes[2],
+            temporal_pooling_heads=getattr(projector, "temporal_pooling_heads", None),
+        )
     if checkpoint_hashes is not None:
         required = {"vjepa_checkpoint_sha256", "wan_checkpoint_sha256"}
         if set(checkpoint_hashes) != required:
@@ -170,6 +184,11 @@ def validate_checkpoint_transition(
             raise RuntimeError(
                 f"Checkpoint schema v{schema} cannot be used for this run; expected v4"
             )
+    saved_run_mode = checkpoint.get("run_mode", "formal")
+    if saved_run_mode not in {"formal", "smoke"}:
+        raise RuntimeError(f"Checkpoint has invalid run_mode: {saved_run_mode!r}")
+    if saved_run_mode == "smoke" and not allow_smoke_checkpoint:
+        raise RuntimeError("Smoke checkpoint requires --allow-smoke-checkpoint")
     if schema == CHECKPOINT_SCHEMA_VERSION:
         stage_max_steps = checkpoint.get("stage_max_steps")
         stage_complete = checkpoint.get("stage_complete")
@@ -296,6 +315,11 @@ def save_checkpoint(
             "stage_max_steps": stage_max_steps,
             "stage_complete": (
                 stage_max_steps is not None and optimizer_step >= stage_max_steps
+            ),
+            "run_mode": (
+                config.get("runtime", {}).get("run_mode", "formal")
+                if isinstance(config, dict)
+                else "formal"
             ),
             "stage": stage,
             "objective_mode": objective_mode,

@@ -24,6 +24,21 @@ class VideoSamplingConfig:
     width: int = 768
     split: Literal["train", "val", "test"] = "train"
     horizontal_flip: bool = True
+    min_native_fps_ratio: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.target_fps <= 0.0:
+            raise ValueError("target_fps must be positive")
+        if not 0.0 <= self.min_native_fps_ratio <= 1.0:
+            raise ValueError("min_native_fps_ratio must be in [0,1]")
+
+
+def native_fps_is_supported(
+    native_fps: float, target_fps: float, min_native_fps_ratio: float
+) -> bool:
+    if native_fps <= 0.0 or target_fps <= 0.0:
+        return False
+    return native_fps + 1.0e-9 >= target_fps * min_native_fps_ratio
 
 
 def _duration_seconds(container, stream) -> float | None:
@@ -46,7 +61,16 @@ def decode_contiguous_clip(path: str, config: VideoSamplingConfig) -> tuple[Tens
         if not container.streams.video:
             raise VideoDecodeError(f"No video stream: {path}")
         stream = container.streams.video[0]
-        native_fps = float(stream.average_rate) if stream.average_rate else config.target_fps
+        if stream.average_rate is None:
+            raise VideoDecodeError(f"Video stream has no native FPS: {path}")
+        native_fps = float(stream.average_rate)
+        if not native_fps_is_supported(
+            native_fps, config.target_fps, config.min_native_fps_ratio
+        ):
+            raise VideoDecodeError(
+                f"Native FPS {native_fps:.6f} is below "
+                f"{config.target_fps * config.min_native_fps_ratio:.6f}: {path}"
+            )
         duration = _duration_seconds(container, stream)
         span = (config.num_frames - 1) / config.target_fps
         if duration is not None and duration + 1e-6 < span:
@@ -83,6 +107,13 @@ def decode_contiguous_clip(path: str, config: VideoSamplingConfig) -> tuple[Tens
             raise VideoDecodeError(
                 f"Decoded {len(frames)}/{config.num_frames} target frames: {path}"
             )
+        if any(
+            current <= previous
+            for previous, current in zip(frame_indices, frame_indices[1:])
+        ):
+            raise VideoDecodeError(
+                f"Sampling produced repeated or non-increasing frame indices: {path}"
+            )
 
     video = torch.stack(frames).permute(0, 3, 1, 2).float().div_(255.0)
     _, _, source_h, source_w = video.shape
@@ -118,12 +149,14 @@ class VideoManifestDataset(Dataset):
         width: int = 768,
         horizontal_flip: bool = True,
         max_decode_retries: int = 3,
+        min_native_fps_ratio: float = 0.0,
     ) -> None:
         try:
             import pandas as pd
         except ImportError as exc:
             raise ImportError("Install pandas and pyarrow to load manifests") from exc
         self.frame = pd.read_parquet(manifest_path).reset_index(drop=True)
+        initial_rows = len(self.frame)
         minimum_duration = (num_frames - 1) / target_fps
         if "path_exists" in self.frame:
             self.frame = self.frame[self.frame["path_exists"].fillna(False)]
@@ -132,6 +165,15 @@ class VideoManifestDataset(Dataset):
         if "duration" in self.frame:
             duration = self.frame["duration"]
             self.frame = self.frame[duration.isna() | (duration >= minimum_duration - 1e-6)]
+        before_fps_filter = len(self.frame)
+        if min_native_fps_ratio > 0.0:
+            if "native_fps" not in self.frame:
+                raise ValueError("Manifest native_fps is required by the FPS policy")
+            native = pd.to_numeric(self.frame["native_fps"], errors="coerce")
+            minimum_native = target_fps * min_native_fps_ratio
+            self.frame = self.frame[
+                native.notna() & (native + 1.0e-9 >= minimum_native)
+            ]
         self.frame = self.frame.reset_index(drop=True)
         if self.frame.empty:
             raise ValueError(
@@ -144,8 +186,36 @@ class VideoManifestDataset(Dataset):
             width=width,
             split=split,
             horizontal_flip=horizontal_flip,
+            min_native_fps_ratio=min_native_fps_ratio,
         )
         self.max_decode_retries = max_decode_retries
+        eligible_native_fps = (
+            pd.to_numeric(self.frame["native_fps"], errors="coerce").dropna()
+            if "native_fps" in self.frame
+            else None
+        )
+        native_fps_distribution = None
+        if eligible_native_fps is not None and not eligible_native_fps.empty:
+            native_fps_distribution = {
+                "count": int(eligible_native_fps.count()),
+                "min": float(eligible_native_fps.min()),
+                "p01": float(eligible_native_fps.quantile(0.01)),
+                "p05": float(eligible_native_fps.quantile(0.05)),
+                "p50": float(eligible_native_fps.quantile(0.50)),
+                "p95": float(eligible_native_fps.quantile(0.95)),
+                "p99": float(eligible_native_fps.quantile(0.99)),
+                "max": float(eligible_native_fps.max()),
+            }
+        self.filter_stats = {
+            "initial_rows": int(initial_rows),
+            "eligible_before_fps_filter": int(before_fps_filter),
+            "filtered_by_native_fps": int(before_fps_filter - len(self.frame)),
+            "eligible_rows": int(len(self.frame)),
+            "target_fps": float(target_fps),
+            "min_native_fps_ratio": float(min_native_fps_ratio),
+            "eligible_native_fps_distribution": native_fps_distribution,
+            "repeated_or_non_increasing_frame_rejections_at_start": 0,
+        }
 
     def __len__(self) -> int:
         return len(self.frame)

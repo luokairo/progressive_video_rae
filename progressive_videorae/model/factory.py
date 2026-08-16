@@ -85,6 +85,12 @@ def build_model(
         spatial_attention_mode=projector_config.get(
             "spatial_attention_mode", "set_causal"
         ),
+        layer_fusion=projector_config.get("layer_fusion", "learned_softmax"),
+        layer_fusion_norm=projector_config.get("layer_fusion_norm", "none"),
+        temporal_pooling=projector_config.get(
+            "temporal_pooling", "hidden_dim_attention"
+        ),
+        temporal_pooling_heads=projector_config.get("temporal_pooling_heads", 16),
         layout_version=state["layout_version"],
     )
     decoder = WanVideoDecoder(

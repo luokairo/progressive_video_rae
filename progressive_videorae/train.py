@@ -44,6 +44,7 @@ from .training.losses import PatchDiscriminator, ProgressiveLosses
 from .training.stages import (
     adversarial_factor,
     configure_stage,
+    repa_factor,
     sample_microbatch_tasks,
     stage1a_phase,
     validate_stage_objective,
@@ -113,12 +114,23 @@ def seed_everything(seed: int, rank: int) -> None:
     torch.cuda.manual_seed_all(value)
 
 
-def cosine_scheduler(optimizer, warmup_steps: int, total_steps: int):
+def cosine_scheduler(
+    optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    min_lr_ratio: float = 0.0,
+):
+    if not 0.0 <= min_lr_ratio <= 1.0:
+        raise ValueError("min_lr_ratio must be in [0,1]")
+    if warmup_steps < 0 or total_steps <= 0:
+        raise ValueError("Scheduler requires warmup_steps >= 0 and total_steps > 0")
+
     def scale(step: int) -> float:
         if step < warmup_steps:
             return float(step + 1) / max(1, warmup_steps)
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, scale)
 
@@ -238,6 +250,7 @@ def reconfigure_distributed_phase(
         optimizer_step=optimizer_step,
         wan_interface_step=int(training.get("wan_interface_step", 2000)),
         wan_full_step=int(training.get("wan_full_step", 5000)),
+        repa_trainable=float(training.get("repa_max_factor", 1.0)) > 0.0,
     )
     module.decoder.enable_gradient_checkpointing(
         checkpointing_for_phase(training, requested_phase)
@@ -309,6 +322,10 @@ def _unique(parameters):
     return result
 
 
+def _has_gradient(parameters) -> int:
+    return int(any(parameter.grad is not None for parameter in parameters))
+
+
 def build_optimizers(model, discriminator, config: dict[str, Any]):
     module = unwrap(model)
     fast_parameters = list(module.projector.parameters()) + list(
@@ -317,7 +334,7 @@ def build_optimizers(model, discriminator, config: dict[str, Any]):
     interface = list(module.decoder.pre_decoder.parameters()) + list(
         module.decoder.decoder.conv1.parameters()
     )
-    if config.get("stage") == "stage1b":
+    if config.get("stage") in ("stage1a_plus", "stage1b"):
         interface = list(module.decoder.temporal_adapter.parameters()) + interface
     else:
         fast_parameters += list(module.decoder.temporal_adapter.parameters())
@@ -332,21 +349,43 @@ def build_optimizers(model, discriminator, config: dict[str, Any]):
         for parameter in module.decoder.parameters()
         if id(parameter) not in used
     ]
+    weight_decay_by_group = config.get("weight_decay_by_group", {})
+    gradient_clip_by_group = config.get("gradient_clip_by_group", {})
+    if not isinstance(weight_decay_by_group, dict):
+        raise TypeError("weight_decay_by_group must be a mapping")
+    if not isinstance(gradient_clip_by_group, dict):
+        raise TypeError("gradient_clip_by_group must be a mapping")
+    default_weight_decay = float(config["weight_decay"])
+    default_gradient_clip = float(config["gradient_clip"])
     groups = [
         {
             "params": fast,
             "lr": float(config.get("projector_lr", 1e-4)),
             "name": "rae_fast",
+            "weight_decay": float(weight_decay_by_group.get("rae_fast", default_weight_decay)),
+            "max_grad_norm": float(gradient_clip_by_group.get("rae_fast", default_gradient_clip)),
         },
         {
             "params": interface,
             "lr": float(config.get("wan_temporal_lr", 2e-5)),
             "name": "wan_temporal",
+            "weight_decay": float(
+                weight_decay_by_group.get("wan_temporal", default_weight_decay)
+            ),
+            "max_grad_norm": float(
+                gradient_clip_by_group.get("wan_temporal", default_gradient_clip)
+            ),
         },
         {
             "params": spatial,
             "lr": float(config.get("wan_spatial_lr", 5e-6)),
             "name": "wan_spatial",
+            "weight_decay": float(
+                weight_decay_by_group.get("wan_spatial", default_weight_decay)
+            ),
+            "max_grad_norm": float(
+                gradient_clip_by_group.get("wan_spatial", default_gradient_clip)
+            ),
         },
     ]
     fused = bool(config.get("fused_optimizer", False))
@@ -364,6 +403,45 @@ def build_optimizers(model, discriminator, config: dict[str, Any]):
         fused=fused,
     )
     return generator, disc
+
+
+def clip_optimizer_gradients(
+    optimizer: torch.optim.Optimizer,
+    *,
+    default_max_norm: float,
+) -> dict[str, float]:
+    """Clip optimizer groups independently while preserving legacy norm logs."""
+
+    parameters = [
+        parameter
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    ]
+    total_pre = gradient_norm(parameters)
+    metrics = {"grad_norm/generator": float(total_pre) if total_pre is not None else 0.0}
+    for group_index, group in enumerate(optimizer.param_groups):
+        name = str(group.get("name", group_index))
+        max_norm = float(group.get("max_grad_norm", default_max_norm))
+        if max_norm <= 0.0:
+            raise ValueError(f"Gradient clip for {name} must be positive")
+        pre = torch.nn.utils.clip_grad_norm_(
+            group["params"],
+            max_norm,
+            error_if_nonfinite=True,
+        )
+        post = gradient_norm(group["params"])
+        pre_value = float(pre)
+        post_value = float(post) if post is not None else 0.0
+        scale = 1.0 if pre_value <= max_norm else max_norm / max(pre_value, 1.0e-12)
+        metrics[f"grad_norm/{name}"] = pre_value
+        metrics[f"grad_norm_post/{name}"] = post_value
+        metrics[f"grad_clip_scale/{name}"] = scale
+        metrics[f"grad_clip_max/{name}"] = max_norm
+    total_post = gradient_norm(parameters)
+    metrics["grad_norm_post/generator"] = (
+        float(total_post) if total_post is not None else 0.0
+    )
+    return metrics
 
 
 def preflight_pretrained_weights(model: nn.Module, report_path: Path | None = None) -> dict:
@@ -495,16 +573,53 @@ def forward_training_batch(
 def validate_resume_training_contract(
     checkpoint: dict[str, Any],
     training: dict[str, Any],
+    data_config: dict[str, Any] | None = None,
 ) -> None:
     saved_bundle = checkpoint.get("config")
     saved = saved_bundle.get("training") if isinstance(saved_bundle, dict) else None
     if not isinstance(saved, dict):
         raise RuntimeError("Resume checkpoint is missing its resolved training config")
+    saved_data = saved_bundle.get("data") if isinstance(saved_bundle, dict) else None
+    if data_config is not None:
+        if not isinstance(saved_data, dict):
+            raise RuntimeError("Resume checkpoint is missing its resolved data config")
+        data_keys = ("num_frames", "target_fps", "min_native_fps_ratio")
+        data_mismatches = {
+            key: (saved_data.get(key, 0.0), data_config.get(key, 0.0))
+            for key in data_keys
+            if saved_data.get(key, 0.0) != data_config.get(key, 0.0)
+        }
+        if data_mismatches:
+            raise RuntimeError(
+                f"Resume sampling contract mismatch: {data_mismatches}"
+            )
     keys = ("micro_batch_size", "gradient_accumulation_steps", "global_batch_size", "max_steps")
     if training.get("stage") == "stage1a":
         keys += (
             "wan_interface_step",
             "wan_full_step",
+            "projector_lr",
+            "wan_temporal_lr",
+            "wan_spatial_lr",
+            "weight_decay",
+
+
+            "weight_decay_by_group",
+            "warmup_steps",
+            "min_lr_ratio",
+            "gradient_clip",
+            "gradient_clip_by_group",
+            "l1_weight",
+            "lpips_weight",
+            "temporal_l1_weight",
+            "repa_local_weight",
+            "repa_global_weight",
+            "repa_start_step",
+            "repa_ramp_steps",
+            "repa_max_factor",
+            "adversarial_weight",
+            "disc_start",
+            "adversarial_ramp_steps",
             "gradient_checkpointing_by_phase",
             "fused_optimizer",
         )
@@ -538,6 +653,23 @@ def validate_resume_training_contract(
     }
     if mismatches:
         raise RuntimeError(f"Resume training contract mismatch: {mismatches}")
+
+
+def validate_init_sampling_contract(
+    checkpoint: dict[str, Any], data_config: dict[str, Any]
+) -> None:
+    saved_bundle = checkpoint.get("config")
+    saved_data = saved_bundle.get("data") if isinstance(saved_bundle, dict) else None
+    if not isinstance(saved_data, dict):
+        raise RuntimeError("Init checkpoint is missing its resolved data config")
+    keys = ("target_fps", "min_native_fps_ratio")
+    mismatches = {
+        key: (saved_data.get(key, 0.0), data_config.get(key, 0.0))
+        for key in keys
+        if saved_data.get(key, 0.0) != data_config.get(key, 0.0)
+    }
+    if mismatches:
+        raise RuntimeError(f"Init sampling contract mismatch: {mismatches}")
 
 
 def main() -> None:
@@ -577,6 +709,8 @@ def main() -> None:
         "Wan2.2",
     )
     stage = training["stage"]
+    if stage == "stage1a_plus":
+        parser.error("Stage 1-A-plus must use progressive_videorae.train_stage1a_plus")
     if stage == "stage1a" and args.init_from is not None:
         parser.error("Stage 1-A must start fresh; --init-from is not allowed")
     if stage != "stage1a" and args.resume is None and args.init_from is None:
@@ -604,6 +738,7 @@ def main() -> None:
         height=data_config["height"],
         width=data_config["width"],
         horizontal_flip=data_config.get("train_horizontal_flip", True),
+        min_native_fps_ratio=float(data_config.get("min_native_fps_ratio", 0.0)),
     )
     sampler = DistributedFullDatasetSampler(
         dataset,
@@ -679,6 +814,7 @@ def main() -> None:
         optimizer_step=0,
         wan_interface_step=int(training.get("wan_interface_step", 2000)),
         wan_full_step=int(training.get("wan_full_step", 5000)),
+        repa_trainable=float(training.get("repa_max_factor", 1.0)) > 0.0,
     )
     model.decoder.enable_gradient_checkpointing(
         checkpointing_for_phase(training, active_phase)
@@ -710,17 +846,23 @@ def main() -> None:
         model, discriminator, training
     )
     generator_scheduler = cosine_scheduler(
-        generator_optimizer, training["warmup_steps"], training["max_steps"]
+        generator_optimizer,
+        training["warmup_steps"],
+        training["max_steps"],
+        min_lr_ratio=float(training.get("min_lr_ratio", 0.0)),
     )
     discriminator_scheduler = cosine_scheduler(
-        discriminator_optimizer, training["warmup_steps"], training["max_steps"]
+        discriminator_optimizer,
+        training["warmup_steps"],
+        training["max_steps"],
+        min_lr_ratio=float(training.get("min_lr_ratio", 0.0)),
     )
 
     optimizer_step = 0
     discriminator_update_count = 0
     checkpoint = None
     if args.init_from:
-        load_checkpoint(
+        checkpoint = load_checkpoint(
             args.init_from,
             model=model,
             discriminator=discriminator,
@@ -732,6 +874,7 @@ def main() -> None:
             allow_smoke_checkpoint=args.allow_smoke_checkpoint,
             selection_certificate=args.selection_certificate,
         )
+        validate_init_sampling_contract(checkpoint, data_config)
     if args.resume:
         checkpoint = load_checkpoint(
             args.resume,
@@ -747,7 +890,7 @@ def main() -> None:
             load_mode="resume",
             allow_smoke_checkpoint=args.allow_smoke_checkpoint,
         )
-        validate_resume_training_contract(checkpoint, training)
+        validate_resume_training_contract(checkpoint, training, data_config)
         if checkpoint.get("run_id") != run_id:
             raise RuntimeError("Resume checkpoint run_id does not match its run directory")
         saved_checkpoint_dir = checkpoint.get("checkpoint_dir")
@@ -786,6 +929,7 @@ def main() -> None:
             if args.selection_certificate is not None
             else None
         ),
+        "run_mode": run_mode,
     }
     bundle = resolved_bundle
     if rank == 0:
@@ -802,6 +946,7 @@ def main() -> None:
             "stage": stage,
             "objective_mode": objective_mode,
             "run_mode": run_mode,
+            "data_filter_stats": dataset.filter_stats,
         },
         rank=rank,
     )
@@ -846,6 +991,12 @@ def main() -> None:
             optimizer_step,
             int(training.get("disc_start", 0)),
             int(training.get("adversarial_ramp_steps", 0)),
+        )
+        current_repa_factor = repa_factor(
+            optimizer_step,
+            int(training.get("repa_start_step", 0)),
+            int(training.get("repa_ramp_steps", 0)),
+            float(training.get("repa_max_factor", 1.0)),
         )
         gan_active = (
             full_count > 0
@@ -902,7 +1053,10 @@ def main() -> None:
                     for parameter in discriminator.parameters():
                         parameter.requires_grad_(False)
                     generator_loss = losses.full_generator(
-                        result, discriminator, adversarial_factor=gan_factor
+                        result,
+                        discriminator,
+                        adversarial_factor=gan_factor,
+                        repa_factor=current_repa_factor,
                     )
                     if gan_active:
                         discriminator_forwards += 1
@@ -965,22 +1119,40 @@ def main() -> None:
 
         optimizer_event = timing.start()
         prefix_window.step()
-        generator_parameters = [
-            parameter
-            for group in generator_optimizer.param_groups
-            for parameter in group["params"]
-        ]
         if bool(training.get("verify_ddp_gradient_sync", False)):
             verify_optimizer_gradients_synchronized(generator_optimizer)
-        for group_index, group in enumerate(generator_optimizer.param_groups):
-            value = gradient_norm(group["params"])
-            if value is not None:
-                name = group.get("name", str(group_index))
-                metrics[f"grad_norm/{name}"] = float(value)
-        generator_grad_norm = torch.nn.utils.clip_grad_norm_(
-            generator_parameters,
-            training["gradient_clip"],
-            error_if_nonfinite=True,
+            module = unwrap(model)
+            time_conv_parameters = [
+                parameter
+                for name, child in module.decoder.decoder.named_modules()
+                if name.endswith("time_conv")
+                for parameter in child.parameters()
+            ]
+            spatial_parameters = next(
+                group["params"]
+                for group in generator_optimizer.param_groups
+                if group.get("name") == "wan_spatial"
+            )
+            metrics.update(
+                {
+                    "gradient_present/encoder": _has_gradient(module.encoder.parameters()),
+                    "gradient_present/projector": _has_gradient(module.projector.parameters()),
+                    "gradient_present/repa_projection": _has_gradient(module.repa_projection.parameters()),
+                    "gradient_present/shared_mask": _has_gradient((module.projector.shared_mask_set,)),
+                    "gradient_present/temporal_adapter": _has_gradient(module.decoder.temporal_adapter.parameters()),
+                    "gradient_present/pre_decoder": _has_gradient(module.decoder.pre_decoder.parameters()),
+                    "gradient_present/wan_conv1": _has_gradient(module.decoder.decoder.conv1.parameters()),
+                    "gradient_present/wan_time_conv": _has_gradient(time_conv_parameters),
+                    "gradient_present/wan_spatial": _has_gradient(spatial_parameters),
+                    "gradient_present/discriminator": _has_gradient(discriminator.parameters()),
+                    "system/ddp_gradient_sync_verified": 1,
+                }
+            )
+        metrics.update(
+            clip_optimizer_gradients(
+                generator_optimizer,
+                default_max_norm=float(training["gradient_clip"]),
+            )
         )
         discriminator_grad_norm = 0.0
         if gan_active:
@@ -991,7 +1163,6 @@ def main() -> None:
                     error_if_nonfinite=True,
                 )
             )
-        metrics["grad_norm/generator"] = float(generator_grad_norm)
         metrics["grad_norm/discriminator"] = discriminator_grad_norm
         generator_optimizer.step()
         generator_scheduler.step()
@@ -1024,7 +1195,8 @@ def main() -> None:
                 "stage": stage,
                 "objective_mode": objective_mode,
                 "objective/prefix_active": int(stage == "stage1b"),
-                "objective/repa_active": 1,
+                "objective/repa_active": int(current_repa_factor > 0.0),
+                "objective/repa_factor": current_repa_factor,
                 "objective/gan_active": int(gan_active),
                 "objective/gan_factor": gan_factor,
                 "system/step_seconds": step_seconds,
